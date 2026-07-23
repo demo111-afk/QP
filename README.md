@@ -354,3 +354,40 @@ qp_copilot/
 - 接入 AI 视觉模型：结合截图做画面级别的标注问题识别（漏标、错标、类别错误等
   BBox 几何数据本身看不出来的问题）。
 
+---
+
+## 10. AI Quality Inspection Phase 1 —— Assets 基础设施（新增）
+
+**这一阶段不是实现 AI，只是给后续 AI 判断准备数据基础**。BBox 采集 / Rule Engine /
+Report / UI 保持第一版逻辑完全不变，以下是新增的部分：
+
+- **`assets_downloader.py`**：Assets（PCD + JPG 文件本体）下载器。复用 `network_recorder.py`
+  已经监听、按帧分组好的 URL（不新增浏览器监听），通过当前已登录的浏览器 context 下载文件。
+  受 `config.yaml` 里新增的 `assets` 配置块控制：
+  - `assets.enabled`：总开关，关掉完全不影响现有任何功能。
+  - `assets.sample_interval`：每隔多少帧下载一次 PCD/JPG 文件本体（只影响 Assets 下载数量，
+    不影响 BBox 采集/Rule Engine/Report——那几个仍然跑完整 `frame_count`）。例如 81 帧、
+    `sample_interval=10` 只下载第 1/11/21/.../81 帧。
+  - 保存目录是项目根下独立的 `assets/`（跟 `outputs/` 平级），结构：
+    ```
+    assets/
+      scene_<scene_id>/
+        metadata.json          # 每帧下载结果：pcd_success / image_count / download_time / errors
+        frame_0001/
+          pointcloud.pcd
+          images/
+            camera_xxx.jpg
+    ```
+- **`test_assets_downloader.py`**：`sample_interval` 选帧逻辑的独立测试，`python
+  test_assets_downloader.py` 直接跑，不需要额外安装测试框架。
+- **`config/vehicle_dimensions.yaml` + `vehicle_dimension_config.py`**：车辆/物体尺寸参考库
+  （Person/Cone/Forklift/Truck/Trailer/Container/AGV，尺寸先留空 `null`，后续补真实数据）。
+  提供 `load()` / `get_dimension()` / `check_dimension()` 接口，**本阶段不接入 Rule Engine**，
+  是独立模块。
+- **`cluster_detector.py`** / **`vision_classifier.py`**：分别是点云聚类候选检测、视觉分类
+  的接口占位（`NotImplementedError`），供后续阶段实现，本阶段不跑任何算法/模型。
+
+**注意**：`cleanup_scene.py` 目前扫描的是 `outputs/reports|screenshots|assets`（`outputs/`
+下那个保留目录），**不会**扫描到新增的根级 `assets/scene_*/` 目录，清理某个 scene 时不会
+连带删除已下载的 Assets——这是已知的待办事项，不在本阶段范围内。
+

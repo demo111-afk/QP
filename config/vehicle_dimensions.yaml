@@ -1,0 +1,265 @@
+# vehicle_dimensions.yaml
+# 车辆/设施尺寸参考库，数据来自《车辆及设施尺寸参考表.xlsx》，单位：米。
+#
+# 结构（每个类别）：
+#   id             对照原表的"序号"，方便回查源表
+#   note           原表"状态或说明"列，原样保留
+#   size_basis     原表"尺寸性质"列，翻译成三种取值：
+#                    given_standard   给定标准尺寸（原表这样标注的类别）
+#                    common_reference 常见参考值——原表脚注明确写了："只适合做尺寸异常
+#                                     初筛，不应直接作为严格判错阈值"，后续接入 Rule
+#                                     Engine 时要按这个区分对待，不能跟 given_standard
+#                                     一样严格判定
+#                    no_fixed_value   不设固定值（"其他车辆"/"组合车辆"这两类，原表
+#                                     明确说明应以实际完整扫描尺寸为准，不编造数字）
+#   reference_size 长/宽/高的参考尺寸；no_fixed_value 类别全部为 null
+#   tolerance      允许偏差比例（不是固定 min/max！）：程序判断时用
+#                    reference_size × (1 - tolerance) ~ reference_size × (1 + tolerance)
+#                  动态算出允许范围，见 vehicle_dimension_config.check_dimension()。
+#                  以后只改这里的 tolerance，判断范围自动更新，不需要改 reference_size，
+#                  也不需要改代码。
+#
+# 有 2 种形态（比如"带箱体"/"不带箱体"）的原表类别，拆成两个类别名（用下划线区分），
+# 因为同一个类别名不能对应两组不同的参考尺寸。
+#
+# 说明（原表脚注）：给定标准尺寸来自实测/既定标准；常见参考值只适合做尺寸异常初筛，
+# 不应直接作为严格判错阈值；其他车辆及组合车辆应以实际完整扫描尺寸为准。
+
+classes:
+  雪糕筒:
+    id: 1
+    note: ""
+    size_basis: "given_standard"
+    reference_size: {length: 0.45, width: 0.45, height: 0.75}
+    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+
+  行人:
+    id: 2
+    note: ""
+    size_basis: "given_standard"
+    reference_size: {length: 0.4, width: 0.5, height: 1.7}
+    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+
+  轿车:
+    id: 3
+    note: "常见乘用轿车"
+    size_basis: "common_reference"
+    reference_size: {length: 4.8, width: 1.9, height: 1.6}
+    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+
+  卡车头:
+    id: 4
+    note: ""
+    size_basis: "given_standard"
+    reference_size: {length: 4.5, width: 3.0, height: 3.5}
+    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+
+  卡车拖架_带箱体:
+    id: 5
+    note: "带箱体"
+    size_basis: "given_standard"
+    reference_size: {length: 13.5, width: 3.0, height: 4.0}
+    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+
+  卡车拖架_不带箱体:
+    id: 5
+    note: "不带箱体"
+    size_basis: "given_standard"
+    reference_size: {length: 13.5, width: 3.0, height: 1.5}
+    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+
+  平板车_带箱体:
+    id: 6
+    note: "带箱体"
+    size_basis: "given_standard"
+    reference_size: {length: 15.0, width: 3.0, height: 4.0}
+    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+
+  平板车_不带箱体:
+    id: 6
+    note: "不带箱体"
+    size_basis: "given_standard"
+    reference_size: {length: 15.0, width: 3.0, height: 1.5}
+    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+
+  锁站:
+    id: 7
+    note: ""
+    size_basis: "given_standard"
+    reference_size: {length: 3.0, width: 1.8, height: 1.5}
+    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+
+  灯塔:
+    id: 8
+    note: ""
+    size_basis: "given_standard"
+    reference_size: {length: 6.5, width: 4.3, height: 8.0}
+    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+
+  场桥:
+    id: 9
+    note: "轮胎吊或轨道吊"
+    size_basis: "given_standard"
+    reference_size: {length: 14.0, width: 1.6, height: 8.0}
+    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+
+  岸桥:
+    id: 10
+    note: ""
+    size_basis: "given_standard"
+    reference_size: {length: 25.0, width: 3.0, height: 8.0}
+    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+
+  自身拖挂车_带箱体:
+    id: 11
+    note: "带箱体，参考卡车拖架"
+    size_basis: "given_standard"
+    reference_size: {length: 13.5, width: 3.0, height: 4.0}
+    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+
+  自身拖挂车_不带箱体:
+    id: 11
+    note: "不带箱体，参考卡车拖架"
+    size_basis: "given_standard"
+    reference_size: {length: 13.5, width: 3.0, height: 1.5}
+    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+
+  其他车辆:
+    id: 12
+    note: "以该序列扫描完整尺寸为准"
+    size_basis: "no_fixed_value"
+    reference_size: {length: null, width: null, height: null}
+    tolerance: {length: null, width: null, height: null}
+
+  工程车:
+    id: 13
+    note: "一般工程作业车辆"
+    size_basis: "common_reference"
+    reference_size: {length: 6.0, width: 2.5, height: 3.0}
+    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+
+  大巴车:
+    id: 14
+    note: "常见大型客车"
+    size_basis: "common_reference"
+    reference_size: {length: 12.0, width: 2.55, height: 3.5}
+    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+
+  叉车:
+    id: 15
+    note: "常见中型叉车"
+    size_basis: "common_reference"
+    reference_size: {length: 3.5, width: 1.5, height: 2.3}
+    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+
+  吊车:
+    id: 16
+    note: "按车体尺寸，吊臂不完全展开"
+    size_basis: "common_reference"
+    reference_size: {length: 12.0, width: 3.0, height: 3.8}
+    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+
+  货车:
+    id: 17
+    note: "常见中型厢式或栏板货车"
+    size_basis: "common_reference"
+    reference_size: {length: 7.0, width: 2.5, height: 3.2}
+    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+
+  登高车:
+    id: 18
+    note: "按完整车体尺寸"
+    size_basis: "common_reference"
+    reference_size: {length: 6.0, width: 2.2, height: 3.0}
+    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+
+  牵引车:
+    id: 19
+    note: "港区或物流牵引车"
+    size_basis: "common_reference"
+    reference_size: {length: 5.5, width: 2.5, height: 3.0}
+    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+
+  飞机拖车甲型:
+    id: 20
+    note: "较小型飞机牵引车"
+    size_basis: "common_reference"
+    reference_size: {length: 4.5, width: 2.2, height: 1.8}
+    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+
+  飞机拖车乙型:
+    id: 21
+    note: "较大型飞机牵引车"
+    size_basis: "common_reference"
+    reference_size: {length: 6.0, width: 3.0, height: 2.0}
+    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+
+  云梯车:
+    id: 22
+    note: "条件允许尽量包含云梯"
+    size_basis: "common_reference"
+    reference_size: {length: 10.0, width: 2.5, height: 3.5}
+    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+
+  行李传送带车:
+    id: 23
+    note: "按完整车体及收拢传送带"
+    size_basis: "common_reference"
+    reference_size: {length: 8.0, width: 2.5, height: 3.0}
+    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+
+  卡车拖架与其他车辆组合:
+    id: 24
+    note: "以组合目标扫描完整尺寸为准"
+    size_basis: "no_fixed_value"
+    reference_size: {length: null, width: null, height: null}
+    tolerance: {length: null, width: null, height: null}
+
+  自行车_无人:
+    id: 25
+    note: ""
+    size_basis: "common_reference"
+    reference_size: {length: 1.8, width: 0.65, height: 1.1}
+    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+
+  自行车_有人:
+    id: 26
+    note: ""
+    size_basis: "common_reference"
+    reference_size: {length: 1.8, width: 0.65, height: 1.8}
+    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+
+  摩托车_无人:
+    id: 27
+    note: ""
+    size_basis: "common_reference"
+    reference_size: {length: 2.1, width: 0.8, height: 1.2}
+    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+
+  摩托车_有人:
+    id: 28
+    note: ""
+    size_basis: "common_reference"
+    reference_size: {length: 2.1, width: 0.8, height: 1.8}
+    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+
+  三轮车_无人:
+    id: 29
+    note: "按完整扫描尺寸"
+    size_basis: "common_reference"
+    reference_size: {length: 2.8, width: 1.2, height: 1.5}
+    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+
+  三轮车_有人:
+    id: 30
+    note: ""
+    size_basis: "common_reference"
+    reference_size: {length: 2.8, width: 1.2, height: 1.8}
+    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+
+  平台车:
+    id: 31
+    note: "常见机场或港区装卸平台车"
+    size_basis: "common_reference"
+    reference_size: {length: 7.0, width: 3.0, height: 2.5}
+    tolerance: {length: 0.20, width: 0.20, height: 0.20}

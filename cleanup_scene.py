@@ -1,16 +1,22 @@
 """
 cleanup_scene.py
-按 scene_id 清理 outputs/ 目录下这个场景产生的本地文件（截图/报告/BBox 数据/网络记录等）。
+按 scene_id 清理 outputs/ 目录下这个场景产生的本地文件（截图/报告/BBox 数据/网络记录等），
+以及 assets/ 目录下这个场景下载的 PCD/JPG 文件（见 assets_downloader.py）。
 
 用于人工判断完一个 scene 之后，清掉这个 scene 的本地测试数据，给下一个 scene 腾地方。
 只读扫描 + 删除文件：
-  - 只在 outputs/reports、outputs/screenshots、outputs/assets 这三个目录里找
-    （目录路径优先读 config.yaml，读不到才退回默认值，见 _load_scan_dirs()）
-  - 只删文件，绝不删除 outputs/ 或其子目录本身
-  - 不会碰任何项目代码/配置文件（.py/.yaml/.md 等）——因为压根不扫描 outputs/ 以外的地方
+  - 在 outputs/reports、outputs/screenshots、outputs/assets（旧的保留目录）这三个目录里
+    按「文件名/内容匹配」找（目录路径优先读 config.yaml，读不到才退回默认值，见 _load_scan_dirs()）
+  - 另外在顶层 assets/（assets_downloader.py 的下载目录）里按「scene_<scene_id> 目录名」
+    匹配（见 find_asset_scene_files()）——这里的文件名本身不带 scene_id
+    （pointcloud.pcd / camera_xxx.jpg），scene_id 只体现在父目录名里，
+    所以不能用上面那套按文件名/内容的匹配逻辑，需要单独处理。
+  - 只删文件，绝不删除 outputs/、assets/ 或它们的子目录本身（scene_<scene_id>/、
+    frame_NNNN/、images/ 这些目录清空后会变成空目录，但不会被 rmdir）
+  - 不会碰任何项目代码/配置文件（.py/.yaml/.md 等）——因为压根不扫描这几个目录以外的地方
   - 不连浏览器、不改采集/规则逻辑，是一个完全独立的小工具
 
-匹配规则（文件名 或 文件内容包含 scene_id 就算相关）：
+匹配规则（outputs/ 下：文件名 或 文件内容包含 scene_id 就算相关）：
   - 图片文件（.png/.jpg/.jpeg）：只按文件名匹配（截图命名是 {scene_id}_frame_NNN.png，
     内容是二进制，扫描内容既没意义也慢）
   - 其它文本文件（.csv/.json/.txt 等）：文件名包含 scene_id，或者文件内容里包含
@@ -22,6 +28,10 @@ cleanup_scene.py
     文件名/内容都匹配不上。这种文件不改它的生成逻辑，而是在这里认：如果它所在的目录
     已经因为别的文件命中了这个 scene_id，说明这一批报告确实是这次场景生成的（同一次
     main.py 运行会把这些报告文件一起写出来），就把它也一并纳入清理范围。
+
+匹配规则（assets/ 下：目录名匹配，见 find_asset_scene_files()）：
+  - assets/scene_<scene_id>/ 目录存在，就把它下面递归找到的所有文件（pointcloud.pcd、
+    images/*.jpg、metadata.json）都当作这个场景的数据一并清理，不需要逐个文件按名字/内容判断。
 
 用法：
     python cleanup_scene.py              # 交互式：列出将删除的文件，输入 DELETE 二次确认才真删
@@ -46,6 +56,11 @@ MAX_CONTENT_SCAN_BYTES = 20 * 1024 * 1024  # 20MB
 # 找不到 config.yaml 或读取失败时的默认目录（跟 config.yaml 里的默认值保持一致）
 DEFAULT_SCAN_DIRS = ["outputs/reports", "outputs/screenshots", "outputs/assets"]
 
+# assets_downloader.py 的下载目录默认值，跟 config.yaml -> assets.output_dir 保持一致。
+# 这是顶层的 assets/（跟上面 DEFAULT_SCAN_DIRS 里的 outputs/assets 是两个不同的目录，
+# 后者是旧的保留目录，本版本没在用）。
+DEFAULT_ASSETS_DOWNLOAD_DIR = "assets"
+
 # 内容里不带 scene_id、没法直接按文件名/内容匹配的报告文件——如果它所在目录已经有
 # 别的文件因为这个 scene_id 匹配上了，就一并纳入清理（见模块开头「匹配规则」的说明）。
 SCENE_AGNOSTIC_COMPANION_FILES = {"mapping_report.txt"}
@@ -69,6 +84,35 @@ def _load_scan_dirs(config_path: str = "config.yaml") -> list[str]:
             dirs.append(d)
 
     return dirs or DEFAULT_SCAN_DIRS
+
+
+def _load_assets_download_dir(config_path: str = "config.yaml") -> str:
+    """读 config.yaml -> assets.output_dir（assets_downloader.py 的下载目录），
+    读不到就用默认值 "assets"。"""
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError):
+        return DEFAULT_ASSETS_DOWNLOAD_DIR
+
+    return config.get("assets", {}).get("output_dir") or DEFAULT_ASSETS_DOWNLOAD_DIR
+
+
+def find_asset_scene_files(scene_id: str, assets_download_dir: str) -> list[tuple[Path, str]]:
+    """在 assets/ 下按 scene_<scene_id> 目录名匹配，而不是按文件名/内容——
+    assets_downloader.py 产出的 pointcloud.pcd / camera_xxx.jpg 文件名本身不带 scene_id，
+    scene_id 只体现在父目录名（scene_<scene_id>）里。目录存在就把它下面递归找到的所有文件
+    都当作这个场景的数据，一并纳入清理范围。"""
+    matches: list[tuple[Path, str]] = []
+    scene_dir = Path(assets_download_dir) / f"scene_{scene_id}"
+    if not scene_dir.is_dir():
+        return matches
+
+    for path in sorted(scene_dir.rglob("*")):
+        if path.is_file() and path.name != ".gitkeep":
+            matches.append((path, "Assets 场景目录匹配"))
+
+    return matches
 
 
 def find_matching_files(scene_id: str, scan_dirs: list[str]) -> list[tuple[Path, str]]:
@@ -141,6 +185,9 @@ def main() -> None:
 
     scan_dirs = _load_scan_dirs()
     matches = find_matching_files(scene_id, scan_dirs)
+
+    assets_download_dir = _load_assets_download_dir()
+    matches += find_asset_scene_files(scene_id, assets_download_dir)
 
     print()
     if not matches:

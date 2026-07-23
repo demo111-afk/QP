@@ -228,6 +228,24 @@ report:
   capture_report_filename: "capture_report.csv"
 
 # -------------------------------------------------------------
+# Assets（PCD + JPG 文件本体）下载（assets_downloader.py）
+# 跟 BBox 无关：BBox 的采集/保存逻辑保持现状，不受这里任何配置影响。
+# 复用 network_recorder.py 已经监听/分组好的 URL，不新增浏览器监听。
+# -------------------------------------------------------------
+assets:
+  enabled: true
+  # 保存目录，跟 outputs/ 完全独立，不放进 reports 也不放进 bbox 数据里
+  output_dir: "assets"
+  # 每隔多少帧下载一次 PCD/JPG 文件本体，只影响 Assets 下载数量，
+  # 不影响 BBox 采集 / Rule Engine / Report（那几个仍然按当前逻辑跑完整 frame_count）。
+  # 例如 81 帧、sample_interval=10 时，只下载第 1/11/21/.../81 帧的 Assets。
+  # 改成 1 表示每一帧都下载。
+  sample_interval: 10
+  download_pcd: true
+  download_jpg: true
+  request_timeout_ms: 30000
+
+# -------------------------------------------------------------
 # 判断分析模块（第一版为空，预留给后续的规则引擎 / AI 视觉模型）
 # 抓取（浏览+截图）和判断分析是两个独立阶段：
 #   main.py     只做抓取，产出截图 + capture_report.csv

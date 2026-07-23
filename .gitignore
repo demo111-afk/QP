@@ -4,6 +4,10 @@ outputs/screenshots/*
 outputs/reports/*
 !outputs/screenshots/.gitkeep
 !outputs/reports/.gitkeep
+
+# Assets Downloader 产出（PCD/JPG 文件本体，体积大，不入库）
+assets/*
+!assets/.gitkeep
 .venv/
 venv/
 env/

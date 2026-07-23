@@ -44,6 +44,7 @@ import sys
 import yaml
 
 from analyzers import run_analyzers
+from assets_downloader import AssetsDownloader
 from bbox_extractor import extract_bbox, save_mapping_report, write_bbox_csv
 from bbox_probe import probe_frame, build_probe_report, save_probe_report
 from browser import BrowserSession
@@ -114,6 +115,7 @@ def run(config_path: str = "config.yaml") -> None:
     bbox_cfg = config["bbox_probe"]
     bbox_extract_cfg = config.get("bbox_extract", {})
     rule_engine_cfg = config.get("rule_engine", {})
+    assets_cfg = config.get("assets", {})
     expected_pcd = network_cfg.get("expected_pcd_count", 1)
     expected_jpg = network_cfg.get("expected_jpg_count", 5)
 
@@ -129,6 +131,9 @@ def run(config_path: str = "config.yaml") -> None:
 
     navigator = FrameNavigator(page, config)
     recorder = NetworkRecorder(page, network_cfg) if network_cfg.get("enabled", True) else None
+    # Assets（PCD/JPG 文件本体）下载器：复用上面已连接的 page，不新增浏览器监听，
+    # 见 assets_downloader.py。跟 BBox 采集完全独立，关掉 assets.enabled 不影响任何现有功能。
+    assets_downloader = AssetsDownloader(page, assets_cfg) if assets_cfg.get("enabled", False) else None
 
     records = []
     asset_records = []
@@ -231,6 +236,12 @@ def run(config_path: str = "config.yaml") -> None:
                 # 供采集全部结束后写进 rule_report.csv（MissingBBox）和 rule_summary.json。
                 missing_bbox_frames.append((frame_index, bbox_result.error))
 
+        # ---- 7. Assets（PCD/JPG 文件本体）下载：跟上面 1~6 步完全独立，放在循环最后一步，
+        # 保证不管下载成功/失败/超时，都不影响本帧已经记录好的切帧/就绪/截图/BBox 结果。
+        # 只在 recorder 启用（有 asset_record 可用）且这一帧命中 sample_interval 时才下载。
+        if assets_downloader and recorder and assets_downloader.should_download(frame_index, start_index):
+            assets_downloader.download_frame(scene_id, frame_index, asset_record)
+
     print()
     ok_count = sum(1 for r in records if not r.warning)
     print(f"[信息] 自动浏览结束，共 {len(records)} 帧，其中 {ok_count} 帧完全正常，{len(records) - ok_count} 帧有 warning。")
@@ -250,6 +261,10 @@ def run(config_path: str = "config.yaml") -> None:
     if recorder and asset_records:
         asset_csv_path = write_asset_csv(asset_records, network_cfg, report_cfg)
         print(f"[信息] 网络资源记录已生成: {asset_csv_path}")
+
+    if assets_downloader:
+        metadata_path = assets_downloader.write_metadata(scene_id)
+        print(f"[信息] Assets 下载 metadata 已生成: {metadata_path}")
 
     if probe_results:
         try:
