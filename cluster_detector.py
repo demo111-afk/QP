@@ -2,8 +2,8 @@
 cluster_detector.py
 点云聚类候选检测——Phase 2：漏标（Missing Annotation）检测的核心模块。
 
-流程（本模块负责 PCD 读取 -> BBox 内部点剔除 -> DBSCAN -> 噪声过滤这几步；
-调用方 rule_engine.py 负责把结果写进 rule_report.csv，两者职责分开）：
+流程（本模块负责 PCD 读取 -> BBox 内部点剔除 -> 降采样/高度过滤 -> DBSCAN -> 噪声过滤
+这几步；调用方 rule_engine.py 负责把结果写进 rule_report.csv，两者职责分开）：
 
     PCD
      |
@@ -17,6 +17,13 @@ cluster_detector.py
     Residual Point Cloud（剩余点云）
      |
      v
+    voxel_downsample()：体素降采样，纯粹减少点数，不做任何"是不是地面"的语义判断
+     |
+     v
+    height_filter()：只保留 z > height_threshold 的点，粗略滤掉地面附近最密集的一层
+     |    （这不是完整 Ground Removal——没有 RANSAC/平面拟合/CSF/Patchwork++，
+     |     只是点云预处理，目的仅仅是让 DBSCAN 的输入规模降到能跑得动）
+     v
     DBSCAN（sklearn.cluster.DBSCAN，只用 x/y/z，不用 intensity）
      |
      v
@@ -25,6 +32,11 @@ cluster_detector.py
      v
     ClusterCandidate 列表（status 固定是 "Possible Missing Annotation" 或
     "Suspicious Residual Cluster"，不判断类别、不调用 Vision/LLM）
+
+背景：真实数据实测过，如果跳过 voxel_downsample/height_filter 直接对全场景残留点云
+（30万级点，其中一半以上是地面）跑 DBSCAN，sklearn 在算近邻列表时会直接内存溢出——
+地面点密度极高，任何一个点附近可能有成百上千个邻居。这两步预处理是让流程在真实点云
+规模下能跑通的必要条件，不是可选优化。
 
 跟 bbox_extractor.py 完全无关：BBox 的读取/保存逻辑保持现状，不会被这里调用或修改。
 本模块消费的是 assets_downloader.py 下载下来的 PCD 文件（本地路径），不重新连浏览器、
@@ -98,7 +110,7 @@ class ClusterCandidate:
     """一个残留点云聚类候选。不含任何类别判断——status 只表示"这个候选离噪声过滤边界
     有多近"，不是"这是什么物体"。"""
     cluster_id: str
-    point_indices: list = field(default_factory=list)   # 在传入的 residual 点云里的行索引
+    point_indices: list = field(default_factory=list)   # 在体素降采样+高度过滤后点云里的行索引
     centroid: tuple[float, float, float] | None = None
     point_count: int = 0
     bbox_hint: dict | None = None    # 残留点的轴对齐包围盒：{"min":.., "max":.., "size":..}
@@ -143,6 +155,42 @@ def remove_bbox_points(points: np.ndarray, boxes: list[OrientedBox], margin: flo
         inside_any |= inside
 
     return points[~inside_any]
+
+
+def voxel_downsample(points: np.ndarray, voxel_size: float) -> np.ndarray:
+    """体素降采样：把空间切成 voxel_size 大小的网格，同一格子里的点合并成它们的质心。
+
+    纯粹是为了减少后续 DBSCAN 的输入规模，不做任何"这是不是地面"之类的语义判断——
+    跟真实场景里占大多数的地面点、离散噪声点，都是同样按网格合并，不做区分。
+    """
+    if points.shape[0] == 0 or voxel_size <= 0:
+        return points
+
+    keys = np.floor(points / voxel_size).astype(np.int64)
+    order = np.lexsort((keys[:, 2], keys[:, 1], keys[:, 0]))
+    sorted_keys = keys[order]
+    sorted_points = points[order]
+
+    changed = np.any(np.diff(sorted_keys, axis=0) != 0, axis=1)
+    boundaries = np.concatenate(([0], np.where(changed)[0] + 1, [len(sorted_keys)]))
+
+    out = np.empty((len(boundaries) - 1, 3), dtype=np.float64)
+    for i in range(len(boundaries) - 1):
+        out[i] = sorted_points[boundaries[i]:boundaries[i + 1]].mean(axis=0)
+    return out
+
+
+def height_filter(points: np.ndarray, height_threshold: float) -> np.ndarray:
+    """简单高度过滤：只保留 z > height_threshold 的点。
+
+    这不是完整的 Ground Removal——没有做 RANSAC 平面拟合、没有 CSF、没有 Patchwork++，
+    只是一个固定阈值的点云预处理步骤，目的仅仅是把地面附近最密集的一层粗略滤掉，
+    减少 DBSCAN 的输入规模。阈值是这一帧点云自己坐标系里的绝对 z 值，不是拟合出来的
+    地面高度——如果不同 scene/雷达安装方式导致 z 原点不一致，这个值可能需要跟着调。
+    """
+    if points.shape[0] == 0:
+        return points
+    return points[points[:, 2] > height_threshold]
 
 
 def _read_pcd(pcd_path: str) -> np.ndarray:
@@ -244,8 +292,9 @@ def detect_clusters(pcd_path: str, boxes: list[OrientedBox], config: dict) -> li
         pcd_path: assets_downloader.py 下载下来的本地 PCD 文件路径
                   （例如 assets/scene_xxx/frame_0011/pointcloud.pcd）
         boxes:    这一帧全部 BBox 转换成的 OrientedBox 列表（调用方负责从 bbox_data.csv 转换）
-        config:   config.yaml -> cluster_detector 这个子配置块（eps/min_points/bbox_margin/
-                  min_cluster_point_count/min_cluster_volume/max_cluster_volume）
+        config:   config.yaml -> cluster_detector 这个子配置块（voxel_size/height_threshold/
+                  eps/min_points/bbox_margin/min_cluster_point_count/min_cluster_volume/
+                  max_cluster_volume）
     """
     points = _read_pcd(pcd_path)
     if points.shape[0] == 0:
@@ -256,9 +305,21 @@ def detect_clusters(pcd_path: str, boxes: list[OrientedBox], config: dict) -> li
     if residual.shape[0] == 0:
         return []
 
-    eps = config.get("eps", 0.5)
-    min_points = config.get("min_points", 10)
-    labels = DBSCAN(eps=eps, min_samples=min_points).fit_predict(residual)
+    # 真实点云（30万级）实测过，跳过这两步直接对 residual 跑 DBSCAN 会内存溢出——
+    # 地面点密度太高，见模块开头的说明。这两步是必须的，不是可选优化。
+    voxel_size = config.get("voxel_size", 0.2)
+    downsampled = voxel_downsample(residual, voxel_size)
+    if downsampled.shape[0] == 0:
+        return []
+
+    height_threshold = config.get("height_threshold", 0.3)
+    filtered_points = height_filter(downsampled, height_threshold)
+    if filtered_points.shape[0] == 0:
+        return []
+
+    eps = config.get("eps", 0.4)
+    min_points = config.get("min_points", 5)
+    labels = DBSCAN(eps=eps, min_samples=min_points).fit_predict(filtered_points)
 
     min_point_count = config.get("min_cluster_point_count", 15)
     min_volume = config.get("min_cluster_volume", 0.05)
@@ -270,7 +331,7 @@ def detect_clusters(pcd_path: str, boxes: list[OrientedBox], config: dict) -> li
             continue  # DBSCAN 自己的噪声标签，不是候选
 
         member_indices = np.where(labels == label)[0]
-        cluster_points = residual[member_indices]
+        cluster_points = filtered_points[member_indices]
         point_count = len(cluster_points)
         if point_count < min_point_count:
             continue

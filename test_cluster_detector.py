@@ -15,7 +15,15 @@ from pathlib import Path
 
 import numpy as np
 
-from cluster_detector import OrientedBox, _euler_xyz_to_matrix, _read_pcd, detect_clusters, remove_bbox_points
+from cluster_detector import (
+    OrientedBox,
+    _euler_xyz_to_matrix,
+    _read_pcd,
+    detect_clusters,
+    height_filter,
+    remove_bbox_points,
+    voxel_downsample,
+)
 
 
 def _write_ascii_pcd(path: Path, points: np.ndarray) -> None:
@@ -103,6 +111,36 @@ def test_read_pcd_ascii_and_binary_match():
     assert np.allclose(parsed_binary, points, atol=1e-3)
 
 
+def test_voxel_downsample_merges_points_in_same_cell():
+    # 4 个点都落在 [0,0.2) x [0,0.2) x [0,0.2) 这同一个 0.2m 格子里，应该合并成 1 个质心点
+    points = np.array([[0.01, 0.01, 0.01], [0.05, 0.02, 0.03], [0.1, 0.15, 0.05], [0.19, 0.19, 0.19]])
+    down = voxel_downsample(points, voxel_size=0.2)
+    assert down.shape[0] == 1
+    assert np.allclose(down[0], points.mean(axis=0))
+
+    # 2 个点分别落在不同格子里，不应该被合并
+    far_points = np.array([[0, 0, 0], [10, 10, 10]])
+    down_far = voxel_downsample(far_points, voxel_size=0.2)
+    assert down_far.shape[0] == 2
+
+
+def test_height_filter_keeps_only_points_above_threshold():
+    points = np.array([[0, 0, -1], [0, 0, 0.1], [0, 0, 0.5], [0, 0, 5]])
+    filtered = height_filter(points, height_threshold=0.3)
+    assert filtered.shape[0] == 2
+    assert np.allclose(sorted(filtered[:, 2].tolist()), [0.5, 5])
+
+
+# detect_clusters 端到端测试用的默认 config：显式关掉 voxel/height 这两步的实际效果
+# （voxel_size 设得比测试点云的间距小很多，height_threshold 设得比所有测试点的 z 都低），
+# 这样这几个测试专注验证 DBSCAN + 噪声过滤本身的行为，不跟体素化/高度过滤混在一起判断。
+_BASE_CFG = {
+    "voxel_size": 0.01, "height_threshold": -1000.0,
+    "eps": 0.5, "min_points": 10, "bbox_margin": 0.05,
+    "min_cluster_point_count": 15, "min_cluster_volume": 0.0001, "max_cluster_volume": 200.0,
+}
+
+
 def test_detect_clusters_end_to_end():
     rng = np.random.default_rng(42)
     covered = rng.normal(loc=[0, 0, 0], scale=0.3, size=(200, 3))          # 落在 BBox 内，应被删除
@@ -111,15 +149,11 @@ def test_detect_clusters_end_to_end():
 
     all_points = np.vstack([covered, residual_cluster, noise])
     box = OrientedBox(center=(0, 0, 0), rotation_euler=(0, 0, 0), size=(2, 2, 2))
-    cfg = {
-        "eps": 0.5, "min_points": 10, "bbox_margin": 0.05,
-        "min_cluster_point_count": 15, "min_cluster_volume": 0.0001, "max_cluster_volume": 200.0,
-    }
 
     with tempfile.TemporaryDirectory() as tmp:
         pcd_path = Path(tmp) / "scene.pcd"
         _write_ascii_pcd(pcd_path, all_points)
-        candidates = detect_clusters(str(pcd_path), [box], cfg)
+        candidates = detect_clusters(str(pcd_path), [box], _BASE_CFG)
 
     assert len(candidates) == 1, f"应该只找到 1 个候选，实际 {len(candidates)}"
     assert candidates[0].point_count >= 70
@@ -131,15 +165,33 @@ def test_detect_clusters_no_residual_returns_empty():
     rng = np.random.default_rng(7)
     covered = rng.normal(loc=[0, 0, 0], scale=0.3, size=(100, 3))
     box = OrientedBox(center=(0, 0, 0), rotation_euler=(0, 0, 0), size=(3, 3, 3))
-    cfg = {"eps": 0.5, "min_points": 10, "bbox_margin": 0.05,
-           "min_cluster_point_count": 15, "min_cluster_volume": 0.0001, "max_cluster_volume": 200.0}
 
     with tempfile.TemporaryDirectory() as tmp:
         pcd_path = Path(tmp) / "scene.pcd"
         _write_ascii_pcd(pcd_path, covered)
-        candidates = detect_clusters(str(pcd_path), [box], cfg)
+        candidates = detect_clusters(str(pcd_path), [box], _BASE_CFG)
 
     assert candidates == []
+
+
+def test_detect_clusters_height_filter_removes_ground_band():
+    rng = np.random.default_rng(99)
+    # "地面"：大量落在 z < 0.3 的密集点，铺满一大片区域，没有被任何 BBox 覆盖
+    ground = rng.normal(loc=[0, 0, 0.05], scale=[20, 20, 0.05], size=(2000, 3))
+    # 真实的漏标目标：z 明显高于地面（比如一个 1.8m 高的物体主体部分）
+    real_object = rng.normal(loc=[5, 5, 1.8], scale=0.2, size=(80, 3))
+
+    all_points = np.vstack([ground, real_object])
+    cfg = dict(_BASE_CFG)
+    cfg["height_threshold"] = 0.3   # 恢复真实的高度过滤阈值，验证地面被滤掉
+
+    with tempfile.TemporaryDirectory() as tmp:
+        pcd_path = Path(tmp) / "scene.pcd"
+        _write_ascii_pcd(pcd_path, all_points)
+        candidates = detect_clusters(str(pcd_path), [], cfg)
+
+    assert len(candidates) == 1, f"高度过滤后应该只剩下真实目标这一个候选，实际 {len(candidates)}"
+    assert candidates[0].centroid[2] > 1.0, "候选的质心高度应该在地面之上"
 
 
 def main() -> None:
@@ -148,8 +200,11 @@ def main() -> None:
         test_remove_bbox_points_axis_aligned,
         test_remove_bbox_points_rotated,
         test_read_pcd_ascii_and_binary_match,
+        test_voxel_downsample_merges_points_in_same_cell,
+        test_height_filter_keeps_only_points_above_threshold,
         test_detect_clusters_end_to_end,
         test_detect_clusters_no_residual_returns_empty,
+        test_detect_clusters_height_filter_removes_ground_band,
     ]
     for test in tests:
         test()

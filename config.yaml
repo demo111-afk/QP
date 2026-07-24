@@ -235,14 +235,25 @@ rule_engine:
   # PossibleMissingAnnotation（漏标）：只发现"未被已有 BBox 覆盖的点云区域"，不判断类别，
   # 不调用 Vision/LLM。读取 assets_downloader.py 已下载的 PCD（assets/scene_id/frame_NNNN/
   # pointcloud.pcd），跟 sample_interval 一样，只能覆盖有下载 PCD 的帧。
+  #
+  # 真实数据实测过（scene 25255，单帧 31 万点）：跳过 voxel_size/height_threshold 这两步
+  # 预处理、直接对全场景残留点跑 DBSCAN 会内存溢出——一半以上的点是地面，密度极高。
+  # 这两步不是完整的 Ground Removal（没有 RANSAC/平面拟合/CSF/Patchwork++），只是固定
+  # 参数的点云预处理，目的仅仅是把 DBSCAN 的输入规模降到能跑得动。下面几个值都是按
+  # 这次真实数据调出来的初始值，跟着实际效果继续调。
   cluster_detector:
-    eps: 0.5                        # 米，DBSCAN 邻域半径（初始值，需要用真实点云密度调）
-    min_points: 10                   # DBSCAN 核心点的最小邻居数
-    bbox_margin: 0.05                 # BBox 内部点判定的裕量比例，避免框边缘的真实点被误判成残留点
-    min_cluster_point_count: 15        # 聚类点数低于这个值，当噪声丢弃
-    min_cluster_volume: 0.05             # 立方米，聚类 AABB 体积下限
-    max_cluster_volume: 200.0              # 立方米，聚类 AABB 体积上限（留得比较宽松，
-                                              # 避免误杀岸桥这种大型设备量级的合法目标）
+    voxel_size: 0.2                  # 米，Voxel Downsample 网格大小。实测 31万点 -> 降到约5万点
+    height_threshold: 0.3             # 米，Simple Height Filter：只保留 z > 这个值的点（这一帧
+                                        # 里 54% 的点挤在 z∈[-0.38,0.22) 这个地面薄层，0.3 能把
+                                        # 这一层滤掉，是这一帧点云自己坐标系里的绝对高度，不是
+                                        # 拟合出来的地面）
+    eps: 0.4                           # 米，DBSCAN 邻域半径（体素化后点间距变大，取体素大小的2倍）
+    min_points: 5                       # DBSCAN 核心点的最小邻居数（体素化后点更稀疏，比不降采样时小）
+    bbox_margin: 0.05                    # BBox 内部点判定的裕量比例，避免框边缘的真实点被误判成残留点
+    min_cluster_point_count: 15            # 聚类点数低于这个值，当噪声丢弃
+    min_cluster_volume: 0.05                 # 立方米，聚类 AABB 体积下限
+    max_cluster_volume: 200.0                  # 立方米，聚类 AABB 体积上限（留得比较宽松，
+                                                  # 避免误杀岸桥这种大型设备量级的合法目标）
 
 # -------------------------------------------------------------
 # 报告设置（report.py）
