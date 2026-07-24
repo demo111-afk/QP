@@ -54,16 +54,16 @@ classes:
     reference_size: {length: 4.5, width: 3.0, height: 3.5}
     tolerance: {length: 0.20, width: 0.20, height: 0.20}
 
-  卡车拖架_带箱体:
+  托架_带箱体:
     id: 5
-    note: "带箱体"
+    note: "带箱体（原表类别名为卡车拖架，平台 className 实际标注为托架，不区分带/不带箱体）"
     size_basis: "given_standard"
     reference_size: {length: 13.5, width: 3.0, height: 4.0}
     tolerance: {length: 0.20, width: 0.20, height: 0.20}
 
-  卡车拖架_不带箱体:
+  托架_不带箱体:
     id: 5
-    note: "不带箱体"
+    note: "不带箱体（原表类别名为卡车拖架，平台 className 实际标注为托架，不区分带/不带箱体）"
     size_basis: "given_standard"
     reference_size: {length: 13.5, width: 3.0, height: 1.5}
     tolerance: {length: 0.20, width: 0.20, height: 0.20}
@@ -124,9 +124,9 @@ classes:
     reference_size: {length: 13.5, width: 3.0, height: 1.5}
     tolerance: {length: 0.20, width: 0.20, height: 0.20}
 
-  其他车辆:
+  其他车:
     id: 12
-    note: "以该序列扫描完整尺寸为准"
+    note: "以该序列扫描完整尺寸为准（原表类别名为其他车辆，平台 className 实际标注为其他车）"
     size_basis: "no_fixed_value"
     reference_size: {length: null, width: null, height: null}
     tolerance: {length: null, width: null, height: null}
@@ -180,16 +180,16 @@ classes:
     reference_size: {length: 5.5, width: 2.5, height: 3.0}
     tolerance: {length: 0.20, width: 0.20, height: 0.20}
 
-  飞机拖车甲型:
+  飞机拖车A:
     id: 20
-    note: "较小型飞机牵引车"
+    note: "较小型飞机牵引车（原表类别名为飞机拖车甲型，平台 className 实际标注为飞机拖车A）"
     size_basis: "common_reference"
     reference_size: {length: 4.5, width: 2.2, height: 1.8}
     tolerance: {length: 0.20, width: 0.20, height: 0.20}
 
-  飞机拖车乙型:
+  飞机拖车B:
     id: 21
-    note: "较大型飞机牵引车"
+    note: "较大型飞机牵引车（原表类别名为飞机拖车乙型，平台 className 命名格式推测为飞机拖车B，尚未在真实数据中观察到，需要之后确认）"
     size_basis: "common_reference"
     reference_size: {length: 6.0, width: 3.0, height: 2.0}
     tolerance: {length: 0.20, width: 0.20, height: 0.20}

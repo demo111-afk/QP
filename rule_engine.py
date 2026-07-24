@@ -58,6 +58,9 @@ from pathlib import Path
 
 import yaml
 
+import vehicle_dimension_config
+from cluster_detector import OrientedBox, detect_clusters
+
 RULE_REPORT_FIELDS = [
     "scene_id",
     "frame_index",
@@ -490,6 +493,183 @@ def rule_static_object_position(ctx: RuleContext) -> list[RuleFinding]:
 
 
 # ---------------------------------------------------------------------------
+# Phase 2：错标（DimensionMismatch）+ 漏标（PossibleMissingAnnotation）
+# ---------------------------------------------------------------------------
+# 两条规则都只用已经完成的模块（vehicle_dimension_config.py 的 Reference Size + Tolerance，
+# cluster_detector.py 的 PCD 残留点聚类），不调用 Vision Model、不调用 Intensity、不做
+# 车辆分类/LLM 判断。结果照样走 RuleFinding/RULE_REGISTRY/_merge_persistent_findings 这条
+# 现有链路，不新建报告文件。
+
+def _measured_lwh(box: dict) -> tuple[float, float, float] | None:
+    """按经过真实数据核对过的映射取实测长宽高：scale_x=length, scale_y=width, scale_z=height
+    （灯塔 scale_z≈8.0m 对参考表 height=8.0 几乎精确吻合；轿车 scale_x>scale_y>scale_z 的
+    量级顺序也符合 length>width>height），不做成配置项，直接写死在这里。"""
+    length = _to_float(box.get("scale_x"))
+    width = _to_float(box.get("scale_y"))
+    height = _to_float(box.get("scale_z"))
+    if length is None or width is None or height is None:
+        return None
+    return (length, width, height)
+
+
+def _resolve_dimension_check(
+    class_name: str,
+    measured_lwh: tuple[float, float, float],
+    dimensions: dict,
+    multi_variant_strategy: str,
+) -> dict:
+    """按 className 查参考尺寸库，处理"托架/平板车/自身拖挂车"这类同一个 className
+    在 vehicle_dimensions.yaml 里对应多个尺寸变体（_带箱体/_不带箱体）的情况——平台的
+    className 不区分这两种状态，所以不能直接按 className 精确匹配一个 key。"""
+    exact = vehicle_dimension_config.get_dimension(class_name, dimensions)
+    variant_keys = [key for key in dimensions if key.startswith(f"{class_name}_")]
+
+    candidate_names = ([class_name] if exact is not None else []) + variant_keys
+    if not candidate_names:
+        return {"status": "unknown_class", "class_name": class_name}
+
+    if len(candidate_names) == 1:
+        return vehicle_dimension_config.check_dimension(candidate_names[0], measured_lwh, dimensions)
+
+    if multi_variant_strategy == "skip":
+        return {"status": "no_reference", "class_name": class_name, "reason": "multi_variant_skip"}
+
+    # any_variant（默认）：只要有一个变体的尺寸在容差内，就算合格。
+    results = [vehicle_dimension_config.check_dimension(name, measured_lwh, dimensions) for name in candidate_names]
+    ok_results = [r for r in results if r.get("status") == "ok"]
+    if not ok_results:
+        return {"status": "no_reference", "class_name": class_name}
+
+    passing = [r for r in ok_results if r["within_tolerance"]]
+    if passing:
+        return passing[0]
+
+    # 全部变体都超出容差：取偏差比例最小（最接近合格）的那个变体的结果用于报告。
+    def _max_ratio(r: dict) -> float:
+        return max(
+            abs(d["measured"] - d["reference"]) / d["reference"] if d["reference"] else float("inf")
+            for d in r["diffs"].values()
+        )
+
+    return min(ok_results, key=_max_ratio)
+
+
+def rule_dimension_mismatch(ctx: RuleContext) -> list[RuleFinding]:
+    """错标检测：BBox 实测尺寸（scale_x/y/z）跟 config/vehicle_dimensions.yaml 里的
+    Reference Size ± Tolerance 比较，超出容差就报 DimensionMismatch。
+
+    当前阶段只用 Object Prior Database（Reference Size + Tolerance），不使用 Vision Model、
+    不使用 Intensity、不做车辆分类。参考尺寸缺失（no_fixed_value，比如"其他车"）或
+    className 在参考库里找不到对应条目时跳过，不编造判断、不报警。
+    """
+    mislabel_cfg = ctx.rule_cfg().get("mislabel", {}) or {}
+    multi_variant_strategy = mislabel_cfg.get("multi_variant_strategy", "any_variant")
+
+    try:
+        dimensions = vehicle_dimension_config.load()
+    except (OSError, yaml.YAMLError) as exc:
+        print(f"[警告] 读取 vehicle_dimensions.yaml 失败，DimensionMismatch 本次跳过: {exc}")
+        return []
+
+    axis_label = {"length": "长度", "width": "宽度", "height": "高度"}
+    findings = []
+    for frame_index, boxes in ctx.frames.items():
+        for box in boxes:
+            class_name = _label_of(box)
+            if not class_name:
+                continue
+            measured = _measured_lwh(box)
+            if measured is None:
+                continue
+
+            result = _resolve_dimension_check(class_name, measured, dimensions, multi_variant_strategy)
+            if result["status"] != "ok" or result["within_tolerance"]:
+                continue
+
+            failed_axes = [axis for axis, diff in result["diffs"].items() if not diff["within_tolerance"]]
+            reasons = []
+            for axis in failed_axes:
+                d = result["diffs"][axis]
+                low, high = d["allowed_range"]
+                reasons.append(
+                    f"{axis_label[axis]}超出容差（实测 {d['measured']:.2f}m，参考 {d['reference']:.2f}m，"
+                    f"允许范围 {low:.2f}~{high:.2f}m）"
+                )
+
+            findings.append(RuleFinding(
+                scene_id=ctx.scene_id, frame_index=frame_index,
+                track_id=_target_key(box), bbox_index=box.get("bbox_index", ""), label=class_name,
+                rule_id="DimensionMismatch", severity="Warning",
+                message="; ".join(reasons),
+                evidence=f"class={result.get('class_name', class_name)}, measured_lwh={measured}, "
+                         f"diffs={result['diffs']}",
+            ))
+    return findings
+
+
+def _boxes_to_oriented(boxes: list[dict]) -> list[OrientedBox]:
+    """把这一帧的 box_dict 列表转换成 cluster_detector.OrientedBox 列表，跳过几何字段
+    不完整的框（缺位置/旋转/尺寸任一项就没法判断点是否在框内，直接跳过，不报错、
+    不中断——bbox_data.csv 里本来就允许某些字段读取失败时留空）。"""
+    oriented = []
+    for box in boxes:
+        pos = _position(box)
+        scale = _scale(box)
+        rot = (_to_float(box.get("rotation_x")), _to_float(box.get("rotation_y")), _to_float(box.get("rotation_z")))
+        if pos is None or scale is None or any(r is None for r in rot):
+            continue
+        oriented.append(OrientedBox(center=pos, rotation_euler=rot, size=scale))
+    return oriented
+
+
+def rule_possible_missing_annotation(ctx: RuleContext) -> list[RuleFinding]:
+    """漏标检测：读取 assets_downloader.py 已下载的 PCD，删除已有 BBox 内部的点
+    （cluster_detector.remove_bbox_points），对剩余点云跑 DBSCAN
+    （cluster_detector.detect_clusters），把过滤后的候选聚类写成 finding。
+
+    不判断 Cluster 属于什么类别，不调用 Vision/LLM——message 只会是 cluster_detector.py
+    给的两个固定状态之一（"Possible Missing Annotation" / "Suspicious Residual Cluster"）。
+
+    只能覆盖已经下载了 PCD 的帧（受 config.yaml -> assets.sample_interval 限制，
+    见 assets_downloader.py）；没有下载 PCD 的帧直接跳过，不报错，不影响其它帧/其它规则。
+    """
+    assets_cfg = ctx.config.get("assets", {}) or {}
+    assets_dir = Path(assets_cfg.get("output_dir", "assets"))
+    cluster_cfg = ctx.rule_cfg().get("cluster_detector", {}) or {}
+
+    findings = []
+    for frame_index in sorted(ctx.expected_frame_indices):
+        pcd_path = assets_dir / f"scene_{ctx.scene_id}" / f"frame_{frame_index:04d}" / "pointcloud.pcd"
+        if not pcd_path.is_file():
+            continue
+
+        boxes = _boxes_to_oriented(ctx.frames.get(frame_index, []))
+        try:
+            candidates = detect_clusters(str(pcd_path), boxes, cluster_cfg)
+        except Exception as exc:
+            print(f"  [警告] 第 {frame_index} 帧漏标检测失败（不影响其它帧/其它规则）: {exc}")
+            continue
+
+        for i, candidate in enumerate(candidates):
+            estimated_size = candidate.bbox_hint["size"] if candidate.bbox_hint else None
+            findings.append(RuleFinding(
+                # track_id 必须是每个候选各自唯一的合成值，不能留空字符串——
+                # _merge_persistent_findings() 只按 (track_id, rule_id) 分组，不看 bbox_index，
+                # 同一帧内两个不同的残留聚类如果都用 track_id=""，会被误合并成一条、丢失数据。
+                # 这里天然也没有跨帧身份识别（Phase 2 明确不做 cluster 追踪），所以每个候选
+                # 只在它被发现的那一帧单独成一条记录，不会跨帧合并，这也是语义上正确的。
+                scene_id=ctx.scene_id, frame_index=frame_index,
+                track_id=f"residual_cluster_{frame_index}_{i}",
+                bbox_index=f"cluster_{i}", label="",
+                rule_id="PossibleMissingAnnotation", severity="Warning",
+                message=candidate.status,
+                evidence=f"point_count={candidate.point_count}, center={candidate.centroid}, "
+                         f"estimated_size={estimated_size}",
+            ))
+    return findings
+
+
+# ---------------------------------------------------------------------------
 # Persistent Issue 去重
 # ---------------------------------------------------------------------------
 
@@ -545,6 +725,8 @@ RULE_REGISTRY = {
     "EmptyFrame": rule_empty_frame,
     "SizeOutlier": rule_size_outlier,
     "StaticObjectPosition": rule_static_object_position,
+    "DimensionMismatch": rule_dimension_mismatch,
+    "PossibleMissingAnnotation": rule_possible_missing_annotation,
 }
 
 

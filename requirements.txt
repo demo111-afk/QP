@@ -3,3 +3,5 @@
 
 playwright>=1.45.0      # 浏览器自动化（连接/驱动 Chrome）
 PyYAML>=6.0             # 读取 config.yaml
+numpy>=1.24              # PCD 点云数值运算（cluster_detector.py）
+scikit-learn>=1.3         # DBSCAN 聚类（cluster_detector.py）

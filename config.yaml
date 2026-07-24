@@ -202,6 +202,8 @@ rule_engine:
     - EmptyFrame                         # 某帧一个框都没有
     - SizeOutlier                          # 框的任一尺寸小于/大于合理范围
     - StaticObjectPosition                   # 静止目标（灯塔/塔桥/场桥/雪糕筒等）不应该移动
+    - DimensionMismatch                        # 错标：BBox 尺寸跟 vehicle_dimensions.yaml 参考尺寸差太多（Phase 2）
+    - PossibleMissingAnnotation                  # 漏标：PCD 里存在未被任何 BBox 覆盖的可疑点云聚类（Phase 2）
 
   # ---- 以下是各规则的参数，全部集中在这里，不要硬编码进代码 ----
   position_jump_threshold: 25.0     # 米，PositionJump 用（原来 10m 太容易误报，改成 25m）
@@ -217,6 +219,30 @@ rule_engine:
     - "场桥"
     - "场桥 轮胎吊 轨道吊"                            # 平台上这个类别的完整 className 是这个复合名，不是单独"场桥"两个字
     - "雪糕筒"
+
+  # ---- 以下是 Phase 2 新增两条规则的参数 ----
+
+  # DimensionMismatch（错标）：只用 config/vehicle_dimensions.yaml 里的 Reference Size +
+  # Tolerance 做判断，不调用 Vision/Intensity，不做车辆分类。
+  # scale_x/y/z -> length/width/height 的映射已经用真实数据核对过（见灯塔 scale_z ≈ 8.0m 高度、
+  # 轿车 scale_x>scale_y>scale_z 符合 length>width>height），直接在 rule_engine.py 里写死，
+  # 不做成配置项。
+  mislabel:
+    multi_variant_strategy: any_variant   # 托架/平板车/自身拖挂车这类有"带箱体/不带箱体"两种
+                                            # 参考尺寸的类别："any_variant" = 落在任一变体的
+                                            # 容差范围内就算合格（平台 className 不区分这两种状态）
+
+  # PossibleMissingAnnotation（漏标）：只发现"未被已有 BBox 覆盖的点云区域"，不判断类别，
+  # 不调用 Vision/LLM。读取 assets_downloader.py 已下载的 PCD（assets/scene_id/frame_NNNN/
+  # pointcloud.pcd），跟 sample_interval 一样，只能覆盖有下载 PCD 的帧。
+  cluster_detector:
+    eps: 0.5                        # 米，DBSCAN 邻域半径（初始值，需要用真实点云密度调）
+    min_points: 10                   # DBSCAN 核心点的最小邻居数
+    bbox_margin: 0.05                 # BBox 内部点判定的裕量比例，避免框边缘的真实点被误判成残留点
+    min_cluster_point_count: 15        # 聚类点数低于这个值，当噪声丢弃
+    min_cluster_volume: 0.05             # 立方米，聚类 AABB 体积下限
+    max_cluster_volume: 200.0              # 立方米，聚类 AABB 体积上限（留得比较宽松，
+                                              # 避免误杀岸桥这种大型设备量级的合法目标）
 
 # -------------------------------------------------------------
 # 报告设置（report.py）
