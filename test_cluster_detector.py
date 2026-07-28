@@ -16,8 +16,10 @@ from pathlib import Path
 import numpy as np
 
 from cluster_detector import (
+    ClusterCandidate,
     OrientedBox,
     _euler_xyz_to_matrix,
+    _merge_nearby_candidates,
     _read_pcd,
     detect_clusters,
     height_filter,
@@ -131,6 +133,13 @@ def test_height_filter_keeps_only_points_above_threshold():
     assert np.allclose(sorted(filtered[:, 2].tolist()), [0.5, 5])
 
 
+def test_height_filter_upper_bound_drops_tall_points():
+    points = np.array([[0, 0, -1], [0, 0, 0.5], [0, 0, 5], [0, 0, 15]])
+    filtered = height_filter(points, height_threshold=0.3, max_height=10.0)
+    assert filtered.shape[0] == 2
+    assert np.allclose(sorted(filtered[:, 2].tolist()), [0.5, 5])
+
+
 # detect_clusters 端到端测试用的默认 config：显式关掉 voxel/height 这两步的实际效果
 # （voxel_size 设得比测试点云的间距小很多，height_threshold 设得比所有测试点的 z 都低），
 # 这样这几个测试专注验证 DBSCAN + 噪声过滤本身的行为，不跟体素化/高度过滤混在一起判断。
@@ -138,6 +147,7 @@ _BASE_CFG = {
     "voxel_size": 0.01, "height_threshold": -1000.0,
     "eps": 0.5, "min_points": 10, "bbox_margin": 0.05,
     "min_cluster_point_count": 15, "min_cluster_volume": 0.0001, "max_cluster_volume": 200.0,
+    "min_flatness": 0.0,   # 默认关掉，跟扁平度无关的测试不受这个新过滤影响
 }
 
 
@@ -174,6 +184,93 @@ def test_detect_clusters_no_residual_returns_empty():
     assert candidates == []
 
 
+def _make_candidate(cluster_id, centroid, point_count, mins, maxs):
+    size = tuple(maxs[i] - mins[i] for i in range(3))
+    return ClusterCandidate(
+        cluster_id=cluster_id, centroid=centroid, point_count=point_count,
+        bbox_hint={"min": mins, "max": maxs, "size": size}, status="Suspicious Residual Cluster",
+    )
+
+
+def test_merge_nearby_candidates_combines_close_centroids():
+    # 两个质心只差 1 米的候选（同一个结构断裂的碎片），应该被合并成 1 条
+    a = _make_candidate("cluster_0", (0.0, 0.0, 0.0), 20, (-0.5, -0.5, -0.5), (0.5, 0.5, 0.5))
+    b = _make_candidate("cluster_1", (1.0, 0.0, 0.0), 30, (0.5, -0.5, -0.5), (1.5, 0.5, 0.5))
+    # 第三个候选离得很远（50米），不应该被卷进来
+    c = _make_candidate("cluster_2", (50.0, 50.0, 50.0), 40, (49.5, 49.5, 49.5), (50.5, 50.5, 50.5))
+
+    merged = _merge_nearby_candidates([a, b, c], merge_distance=3.0)
+
+    assert len(merged) == 2, f"应该合并成 2 条（a+b 合并，c 保持独立），实际 {len(merged)}"
+    combined = next(m for m in merged if m.merged_fragment_count == 2)
+    untouched = next(m for m in merged if m.merged_fragment_count == 1)
+
+    assert combined.point_count == 50, "合并后点数应该是两个碎片相加"
+    # 按点数加权平均：(0*20 + 1*30) / 50 = 0.6
+    assert np.isclose(combined.centroid[0], 0.6)
+    assert combined.bbox_hint["min"] == (-0.5, -0.5, -0.5)
+    assert combined.bbox_hint["max"] == (1.5, 0.5, 0.5), "包围盒应该是两个碎片的并集"
+    assert combined.status == "Possible Missing Annotation"
+
+    assert untouched.cluster_id == "cluster_2"
+    assert untouched.point_count == 40
+
+
+def test_merge_nearby_candidates_no_op_when_all_far_apart():
+    a = _make_candidate("cluster_0", (0.0, 0.0, 0.0), 20, (-0.5,) * 3, (0.5,) * 3)
+    b = _make_candidate("cluster_1", (100.0, 0.0, 0.0), 30, (99.5, -0.5, -0.5), (100.5, 0.5, 0.5))
+    merged = _merge_nearby_candidates([a, b], merge_distance=3.0)
+    assert len(merged) == 2
+    assert all(m.merged_fragment_count == 1 for m in merged)
+
+
+def test_detect_clusters_merges_fragmented_structure():
+    rng = np.random.default_rng(123)
+    # 一个真实结构因为内部有空隙，被切成两段紧挨着的点云（间距略大于 eps=0.4，
+    # 第一遍 DBSCAN 会把它们分成 2 个独立候选），但两段质心相距不到 1 米，
+    # 应该被 merge_distance=3.0 这一步重新合并成 1 条。
+    fragment_1 = rng.normal(loc=[10, 10, 5.0], scale=0.05, size=(60, 3))
+    fragment_2 = rng.normal(loc=[10, 10, 6.5], scale=0.05, size=(60, 3))  # 跟 fragment_1 隔 1.5m
+    # 间距 1.5m 明显大于 DBSCAN 第一遍的 eps=0.4，两段会先被分成 2 个独立候选，
+    # 再靠 merge_distance=3.0 这一步重新拼回 1 条。
+    all_points = np.vstack([fragment_1, fragment_2])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        pcd_path = Path(tmp) / "scene.pcd"
+        _write_ascii_pcd(pcd_path, all_points)
+        candidates = detect_clusters(str(pcd_path), [], _BASE_CFG)
+
+    assert len(candidates) == 1, f"两段应该被合并成 1 条，实际 {len(candidates)}"
+    assert candidates[0].merged_fragment_count == 2, "应该是由 2 个碎片合并而来"
+    # 体素降采样会让点数略微减少（同一个体素里的点合并成 1 个），不要求跟原始 120 完全相等
+    assert candidates[0].point_count >= 110
+
+
+def test_detect_clusters_flatness_filter_drops_thin_structures():
+    rng = np.random.default_rng(55)
+    # 一段"围栏杆"：x 方向跨 4 米，y/z 方向只有 0.1 米左右，扁平度约 0.1/4 = 0.025，
+    # 明显低于 min_flatness=0.25，应该被滤掉。
+    fence = np.column_stack([
+        rng.uniform(0, 4, 100),
+        rng.normal(0, 0.03, 100),
+        rng.normal(0, 0.03, 100),
+    ])
+    # 一个"敦实"的目标：三个方向尺寸接近，扁平度高，应该保留。
+    compact = rng.normal(loc=[20, 20, 1.0], scale=0.3, size=(80, 3))
+
+    all_points = np.vstack([fence, compact])
+    cfg = dict(_BASE_CFG)
+    cfg["min_flatness"] = 0.25
+
+    with tempfile.TemporaryDirectory() as tmp:
+        pcd_path = Path(tmp) / "scene.pcd"
+        _write_ascii_pcd(pcd_path, all_points)
+        candidates = detect_clusters(str(pcd_path), [], cfg)
+
+    assert len(candidates) == 1, f"围栏杆应该被扁平度过滤掉，只剩敦实目标，实际 {len(candidates)}"
+    assert np.allclose(candidates[0].centroid, [20, 20, 1.0], atol=1.0)
+
+
 def test_detect_clusters_height_filter_removes_ground_band():
     rng = np.random.default_rng(99)
     # "地面"：大量落在 z < 0.3 的密集点，铺满一大片区域，没有被任何 BBox 覆盖
@@ -202,8 +299,13 @@ def main() -> None:
         test_read_pcd_ascii_and_binary_match,
         test_voxel_downsample_merges_points_in_same_cell,
         test_height_filter_keeps_only_points_above_threshold,
+        test_height_filter_upper_bound_drops_tall_points,
         test_detect_clusters_end_to_end,
         test_detect_clusters_no_residual_returns_empty,
+        test_merge_nearby_candidates_combines_close_centroids,
+        test_merge_nearby_candidates_no_op_when_all_far_apart,
+        test_detect_clusters_merges_fragmented_structure,
+        test_detect_clusters_flatness_filter_drops_thin_structures,
         test_detect_clusters_height_filter_removes_ground_band,
     ]
     for test in tests:

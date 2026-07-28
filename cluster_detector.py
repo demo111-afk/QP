@@ -3,7 +3,7 @@ cluster_detector.py
 点云聚类候选检测——Phase 2：漏标（Missing Annotation）检测的核心模块。
 
 流程（本模块负责 PCD 读取 -> BBox 内部点剔除 -> 降采样/高度过滤 -> DBSCAN -> 噪声过滤
-这几步；调用方 rule_engine.py 负责把结果写进 rule_report.csv，两者职责分开）：
+-> 候选层面合并这几步；调用方 rule_engine.py 负责把结果写进 rule_report.csv，两者职责分开）：
 
     PCD
      |
@@ -29,6 +29,9 @@ cluster_detector.py
      v
     过滤噪声（点数 / AABB 体积）
      |
+     v
+    _merge_nearby_candidates()：质心距离很近的候选合并成一条（同一个真实结构如果内部有
+     |    空隙，容易被 DBSCAN 切成好几个碎片，这一步把它们拼回一个），纯几何操作，不判断类别
      v
     ClusterCandidate 列表（status 固定是 "Possible Missing Annotation" 或
     "Suspicious Residual Cluster"，不判断类别、不调用 Vision/LLM）
@@ -115,6 +118,7 @@ class ClusterCandidate:
     point_count: int = 0
     bbox_hint: dict | None = None    # 残留点的轴对齐包围盒：{"min":.., "max":.., "size":..}
     status: str = ""                  # "Possible Missing Annotation" | "Suspicious Residual Cluster"
+    merged_fragment_count: int = 1     # 由几个原始 DBSCAN 碎片合并而来；1 表示没有被合并过
 
 
 def _euler_xyz_to_matrix(rx: float, ry: float, rz: float) -> np.ndarray:
@@ -180,17 +184,23 @@ def voxel_downsample(points: np.ndarray, voxel_size: float) -> np.ndarray:
     return out
 
 
-def height_filter(points: np.ndarray, height_threshold: float) -> np.ndarray:
-    """简单高度过滤：只保留 z > height_threshold 的点。
+def height_filter(points: np.ndarray, height_threshold: float, max_height: float | None = None) -> np.ndarray:
+    """简单高度过滤：只保留 height_threshold < z（< max_height，如果给了的话）的点。
 
     这不是完整的 Ground Removal——没有做 RANSAC 平面拟合、没有 CSF、没有 Patchwork++，
-    只是一个固定阈值的点云预处理步骤，目的仅仅是把地面附近最密集的一层粗略滤掉，
-    减少 DBSCAN 的输入规模。阈值是这一帧点云自己坐标系里的绝对 z 值，不是拟合出来的
-    地面高度——如果不同 scene/雷达安装方式导致 z 原点不一致，这个值可能需要跟着调。
+    只是固定阈值的点云预处理步骤。下限（height_threshold）滤掉地面附近最密集的一层；
+    上限（max_height）滤掉明显高于参考表里最高目标（岸桥/灯塔/场桥都是 8m 量级）的点——
+    这些多半是周围建筑物/高层结构，不太可能是漏标的目标物体，同时它们镂空的结构容易被
+    DBSCAN 切成一堆小碎片，是"漏标候选数量偏多"的一个主要来源。
+    两个阈值都是这一帧点云自己坐标系里的绝对 z 值，不是拟合出来的地面/建筑高度——
+    如果不同 scene/雷达安装方式导致 z 原点不一致，这两个值可能需要跟着调。
     """
     if points.shape[0] == 0:
         return points
-    return points[points[:, 2] > height_threshold]
+    mask = points[:, 2] > height_threshold
+    if max_height is not None:
+        mask &= points[:, 2] < max_height
+    return points[mask]
 
 
 def _read_pcd(pcd_path: str) -> np.ndarray:
@@ -293,8 +303,8 @@ def detect_clusters(pcd_path: str, boxes: list[OrientedBox], config: dict) -> li
                   （例如 assets/scene_xxx/frame_0011/pointcloud.pcd）
         boxes:    这一帧全部 BBox 转换成的 OrientedBox 列表（调用方负责从 bbox_data.csv 转换）
         config:   config.yaml -> cluster_detector 这个子配置块（voxel_size/height_threshold/
-                  eps/min_points/bbox_margin/min_cluster_point_count/min_cluster_volume/
-                  max_cluster_volume）
+                  max_height/eps/min_points/bbox_margin/min_cluster_point_count/
+                  min_cluster_volume/max_cluster_volume/min_flatness/merge_distance）
     """
     points = _read_pcd(pcd_path)
     if points.shape[0] == 0:
@@ -313,7 +323,8 @@ def detect_clusters(pcd_path: str, boxes: list[OrientedBox], config: dict) -> li
         return []
 
     height_threshold = config.get("height_threshold", 0.3)
-    filtered_points = height_filter(downsampled, height_threshold)
+    max_height = config.get("max_height")
+    filtered_points = height_filter(downsampled, height_threshold, max_height)
     if filtered_points.shape[0] == 0:
         return []
 
@@ -324,6 +335,7 @@ def detect_clusters(pcd_path: str, boxes: list[OrientedBox], config: dict) -> li
     min_point_count = config.get("min_cluster_point_count", 15)
     min_volume = config.get("min_cluster_volume", 0.05)
     max_volume = config.get("max_cluster_volume", 200.0)
+    min_flatness = config.get("min_flatness", 0.25)
 
     candidates: list[ClusterCandidate] = []
     for label in sorted(set(labels)):
@@ -341,6 +353,13 @@ def detect_clusters(pcd_path: str, boxes: list[OrientedBox], config: dict) -> li
         size = maxs - mins
         volume = float(size[0] * size[1] * size[2])
         if volume < min_volume or volume > max_volume:
+            continue
+
+        # 扁平度 = 包围盒最短边 / 最长边。围栏杆、电缆、薄片状结构件这类明显不是
+        # "敦实"三维物体的候选，比值会很小；数值越接近 1 说明三个方向的尺寸越接近，
+        # 越像人/锥桶/车辆这类目标。纯几何计算，不判断类别。
+        flatness = float(size.min() / size.max()) if size.max() > 0 else 0.0
+        if flatness < min_flatness:
             continue
 
         centroid = cluster_points.mean(axis=0)
@@ -369,4 +388,54 @@ def detect_clusters(pcd_path: str, boxes: list[OrientedBox], config: dict) -> li
             )
         )
 
-    return candidates
+    merge_distance = config.get("merge_distance", 3.0)
+    return _merge_nearby_candidates(candidates, merge_distance)
+
+
+def _merge_nearby_candidates(candidates: list[ClusterCandidate], merge_distance: float) -> list[ClusterCandidate]:
+    """把质心距离很近的候选合并成一条——同一个真实结构（比如镂空的塔架/龙门吊）如果内部
+    有空隙，第一遍 DBSCAN（eps 很小，为了不把相邻但确实不同的物体粘在一起）容易把它切成
+    好几个独立的小碎片。这里不再看原始点，只把每个候选简化成它的质心，对这些质心
+    再跑一次 DBSCAN（复用同一个工具），用一个大得多的 eps（merge_distance，默认 3 米）——
+    质心挨得这么近的候选，大概率是同一个真实物体断裂开的碎片，不是两个独立的东西。
+
+    这一步纯粹是几何操作（质心距离、包围盒并集），不做任何类别判断。合并后的记录直接判定
+    "Possible Missing Annotation"（多个独立碎片能拼成一个连贯结构，是更强的证据，不再用
+    "离阈值多近"那套模糊判断）；没有被合并的候选保持原来的 status 不变。
+    """
+    if len(candidates) <= 1 or merge_distance <= 0:
+        return candidates
+
+    centroids = np.array([c.centroid for c in candidates])
+    group_labels = DBSCAN(eps=merge_distance, min_samples=1).fit_predict(centroids)
+
+    merged: list[ClusterCandidate] = []
+    for group_label in sorted(set(group_labels)):
+        members = [c for c, g in zip(candidates, group_labels) if g == group_label]
+        if len(members) == 1:
+            merged.append(members[0])
+            continue
+
+        total_points = sum(m.point_count for m in members)
+        weighted_centroid = tuple(
+            sum(m.centroid[axis] * m.point_count for m in members) / total_points
+            for axis in range(3)
+        )
+        mins = tuple(min(m.bbox_hint["min"][axis] for m in members) for axis in range(3))
+        maxs = tuple(max(m.bbox_hint["max"][axis] for m in members) for axis in range(3))
+        size = tuple(maxs[axis] - mins[axis] for axis in range(3))
+        merged_indices = [idx for m in members for idx in m.point_indices]
+
+        merged.append(
+            ClusterCandidate(
+                cluster_id="+".join(m.cluster_id for m in members),
+                point_indices=merged_indices,
+                centroid=weighted_centroid,
+                point_count=total_points,
+                bbox_hint={"min": mins, "max": maxs, "size": size},
+                status="Possible Missing Annotation",
+                merged_fragment_count=len(members),
+            )
+        )
+
+    return merged

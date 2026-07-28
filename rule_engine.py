@@ -664,7 +664,7 @@ def rule_possible_missing_annotation(ctx: RuleContext) -> list[RuleFinding]:
                 rule_id="PossibleMissingAnnotation", severity="Warning",
                 message=candidate.status,
                 evidence=f"point_count={candidate.point_count}, center={candidate.centroid}, "
-                         f"estimated_size={estimated_size}",
+                         f"estimated_size={estimated_size}, merged_fragment_count={candidate.merged_fragment_count}",
             ))
     return findings
 
