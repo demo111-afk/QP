@@ -5,14 +5,14 @@ cleanup_scene.py
 
 用于人工判断完一个 scene 之后，清掉这个 scene 的本地测试数据，给下一个 scene 腾地方。
 只读扫描 + 删除文件：
-  - 在 outputs/reports、outputs/screenshots、outputs/assets（旧的保留目录）这三个目录里
+  - 在 outputs/reports、outputs/screenshots 这两个目录里
     按「文件名/内容匹配」找（目录路径优先读 config.yaml，读不到才退回默认值，见 _load_scan_dirs()）
   - 另外在顶层 assets/（assets_downloader.py 的下载目录）里按「scene_<scene_id> 目录名」
     匹配（见 find_asset_scene_files()）——这里的文件名本身不带 scene_id
     （pointcloud.pcd / camera_xxx.jpg），scene_id 只体现在父目录名里，
     所以不能用上面那套按文件名/内容的匹配逻辑，需要单独处理。
-  - 只删文件，绝不删除 outputs/、assets/ 或它们的子目录本身（scene_<scene_id>/、
-    frame_NNNN/、images/ 这些目录清空后会变成空目录，但不会被 rmdir）
+  - outputs/ 下只删匹配文件，不删 reports/screenshots 根目录；根级 assets/ 下会删除
+    assets/scene_<scene_id>/ 目录树，避免清理后留下空的 frame_NNNN/images 目录
   - 不会碰任何项目代码/配置文件（.py/.yaml/.md 等）——因为压根不扫描这几个目录以外的地方
   - 不连浏览器、不改采集/规则逻辑，是一个完全独立的小工具
 
@@ -54,11 +54,10 @@ BINARY_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 MAX_CONTENT_SCAN_BYTES = 20 * 1024 * 1024  # 20MB
 
 # 找不到 config.yaml 或读取失败时的默认目录（跟 config.yaml 里的默认值保持一致）
-DEFAULT_SCAN_DIRS = ["outputs/reports", "outputs/screenshots", "outputs/assets"]
+DEFAULT_SCAN_DIRS = ["outputs/reports", "outputs/screenshots"]
 
 # assets_downloader.py 的下载目录默认值，跟 config.yaml -> assets.output_dir 保持一致。
-# 这是顶层的 assets/（跟上面 DEFAULT_SCAN_DIRS 里的 outputs/assets 是两个不同的目录，
-# 后者是旧的保留目录，本版本没在用）。
+# 这是顶层的 assets/，即 assets_downloader.py 实际保存 PCD/JPG 的目录。
 DEFAULT_ASSETS_DOWNLOAD_DIR = "assets"
 
 # 内容里不带 scene_id、没法直接按文件名/内容匹配的报告文件——如果它所在目录已经有
@@ -78,8 +77,7 @@ def _load_scan_dirs(config_path: str = "config.yaml") -> list[str]:
     dirs = []
     report_dir = config.get("report", {}).get("output_dir")
     screenshot_dir = config.get("screenshot", {}).get("output_dir")
-    assets_dir = config.get("network", {}).get("assets_dir")
-    for d in (report_dir, screenshot_dir, assets_dir):
+    for d in (report_dir, screenshot_dir):
         if d:
             dirs.append(d)
 
@@ -114,6 +112,21 @@ def find_asset_scene_files(scene_id: str, assets_download_dir: str) -> list[tupl
 
     return matches
 
+
+
+
+def find_asset_scene_dirs(scene_id: str, assets_download_dir: str) -> list[Path]:
+    """返回 assets/scene_<scene_id>/ 下需要清理的目录列表，包含 scene 目录本身。
+
+    这个函数用于 dry-run 展示，也覆盖“文件已经删掉但空目录还残留”的场景。
+    """
+    scene_dir = Path(assets_download_dir) / f"scene_{scene_id}"
+    if not scene_dir.is_dir():
+        return []
+    dirs = [p for p in scene_dir.rglob("*") if p.is_dir()]
+    dirs.sort(key=lambda p: len(p.parts), reverse=True)
+    dirs.append(scene_dir)
+    return dirs
 
 def find_matching_files(scene_id: str, scan_dirs: list[str]) -> list[tuple[Path, str]]:
     """在 scan_dirs 里找文件名或内容包含 scene_id 的文件，返回 [(路径, 匹配原因), ...]。
@@ -164,7 +177,7 @@ def find_matching_files(scene_id: str, scan_dirs: list[str]) -> list[tuple[Path,
 
 
 def delete_files(matches: list[tuple[Path, str]]) -> int:
-    """实际删除文件，返回成功删除的数量。只删文件（path.unlink），不删任何目录。"""
+    """实际删除文件，返回成功删除的数量。"""
     deleted = 0
     for path, _reason in matches:
         try:
@@ -173,6 +186,34 @@ def delete_files(matches: list[tuple[Path, str]]) -> int:
         except OSError as exc:
             print(f"[警告] 删除失败: {path} ({exc})")
     return deleted
+
+
+def remove_empty_asset_scene_dirs(scene_id: str, assets_download_dir: str, warn: bool = True) -> int:
+    """删除 assets/scene_<scene_id>/ 下已经清空的目录，最后删除 scene 目录本身。
+
+    只处理这个精确匹配的 scene 目录，不碰 assets/ 根目录和其它 scene。目录里如果还
+    有未删除文件（例如权限问题导致 unlink 失败），对应目录会保留并打印 warning。
+    """
+    scene_dir = Path(assets_download_dir) / f"scene_{scene_id}"
+    if not scene_dir.is_dir():
+        return 0
+
+    removed = 0
+    for path in sorted((p for p in scene_dir.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
+        try:
+            path.rmdir()
+            removed += 1
+        except OSError:
+            pass
+
+    try:
+        scene_dir.rmdir()
+        removed += 1
+    except OSError as exc:
+        if warn:
+            print(f"[警告] Assets 场景目录未能删除（可能仍有文件）: {scene_dir} ({exc})")
+
+    return removed
 
 
 def main() -> None:
@@ -188,19 +229,22 @@ def main() -> None:
 
     assets_download_dir = _load_assets_download_dir()
     matches += find_asset_scene_files(scene_id, assets_download_dir)
+    asset_dirs = find_asset_scene_dirs(scene_id, assets_download_dir)
 
     print()
-    if not matches:
-        print(f"[信息] 没有找到跟 scene_id={scene_id!r} 相关的文件。")
+    if not matches and not asset_dirs:
+        print(f"[信息] 没有找到跟 scene_id={scene_id!r} 相关的文件或 Assets 目录。")
         return
 
-    print(f"将删除（scene_id={scene_id!r}，共 {len(matches)} 个文件）：")
+    print(f"将删除（scene_id={scene_id!r}，共 {len(matches)} 个文件，{len(asset_dirs)} 个 Assets 目录）：")
     for path, reason in matches:
         print(f"  {path.as_posix()}（{reason}）")
+    for path in asset_dirs:
+        print(f"  {path.as_posix()}/（空目录清理）")
 
     if dry_run:
         print()
-        print(f"[信息] dry-run 模式，以上 {len(matches)} 个文件不会被真正删除。")
+        print(f"[信息] dry-run 模式，以上 {len(matches)} 个文件和 {len(asset_dirs)} 个目录不会被真正删除。")
         return
 
     print()
@@ -210,8 +254,9 @@ def main() -> None:
         return
 
     deleted = delete_files(matches)
+    removed_dirs = remove_empty_asset_scene_dirs(scene_id, assets_download_dir)
     print()
-    print(f"[信息] 已删除 {deleted} / {len(matches)} 个文件。")
+    print(f"[信息] 已删除 {deleted} / {len(matches)} 个文件，清理空 Assets 目录 {removed_dirs} 个。")
 
 
 if __name__ == "__main__":

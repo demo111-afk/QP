@@ -291,12 +291,13 @@ python cleanup_scene.py --dry-run     # 只看会删哪些文件，不会真的�
 
 （UI 里 **Cleanup Scene** 区域是同一个脚本的图形化入口）
 
-输入 scene_id 后，会在 `outputs/reports`、`outputs/screenshots`、`outputs/assets`
-三个目录里找**文件名或内容包含这个 scene_id** 的文件（截图靠文件名，固定名字的报告文件
-靠内容里的 `scene_id` 字段；`mapping_report.txt` 内容不带 scene_id，如果同目录下已经有
-别的文件匹配上了，会一并纳入清理），列出清单，输入 `DELETE`（一字不差）才会真正删除。
+输入 scene_id 后，会在 `outputs/reports`、`outputs/screenshots` 两个目录里找**文件名或
+内容包含这个 scene_id** 的文件（截图靠文件名，固定名字的报告文件靠内容里的 `scene_id`
+字段；`mapping_report.txt` 内容不带 scene_id，如果同目录下已经有别的文件匹配上了，会一并
+纳入清理）。同时会删除根级 `assets/scene_<scene_id>/` 下的 PCD/JPG/debug 文件，并在文件
+删除后清掉空目录。列出清单后，输入 `DELETE`（一字不差）才会真正删除。
 
-安全边界：只在这三个目录里找，不会碰项目代码；只删文件，不删 `outputs/` 或子目录本身；
+安全边界：只在上述输出目录和精确匹配的 `assets/scene_<scene_id>/` 里处理，不会碰项目代码；
 `.gitkeep` 不参与匹配；`scene_id` 留空直接退出，不做任何事。
 
 ---
@@ -350,7 +351,6 @@ qp_copilot/
 ├── assets/                         # PCD/JPG 文件本体：assets/scene_<scene_id>/frame_NNNN/
 └── outputs/
     ├── screenshots/    # 每帧截图
-    ├── assets/         # 旧保留目录
     └── reports/         # 见第 2 节「输出文件一览」
 ```
 
@@ -411,5 +411,5 @@ qp_copilot/
 - **`cluster_detector.py`**：已经实现 PCD 读取、BBox 内点删除、预处理、两级聚类、PCA 形状过滤，
   并通过 `PossibleMissingAnnotation` 写入现有 Rule Report。
 - **`vision_classifier.py`**：仍是接口占位，当前不调用任何模型/API。
-- **`cleanup_scene.py`**：现在会同时扫描 `outputs/reports`、`outputs/screenshots`、
-  `outputs/assets` 以及根级 `assets/scene_<scene_id>/` 下的文件。
+- **`cleanup_scene.py`**：现在会同时扫描 `outputs/reports`、`outputs/screenshots`，
+  并删除根级 `assets/scene_<scene_id>/` 下的文件和空目录。

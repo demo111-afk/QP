@@ -82,8 +82,6 @@ screenshot:
 # -------------------------------------------------------------
 network:
   enabled: true
-  # 保留目录，用于以后如果需要缓存/下载实际的 PCD、JPG 文件（第一版只记录 URL，不下载文件）
-  assets_dir: "outputs/assets"
   # 输出的 CSV 文件名（保存在 report.output_dir 下）
   output_filename: "network_assets.csv"
 
