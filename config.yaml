@@ -240,6 +240,8 @@ rule_engine:
   # 参数的点云预处理，目的仅仅是把 DBSCAN 的输入规模降到能跑得动。下面几个值都是按
   # 这次真实数据调出来的初始值，跟着实际效果继续调。
   cluster_detector:
+    max_detection_range: 100.0        # 米，只对 LiDAR 周围 100m 水平半径内的残余点做漏标聚类；
+                                        # 只影响 Cluster Detector，不影响 BBox 收集、Rule Report 或切帧。
     voxel_size: 0.2                  # 米，Voxel Downsample 网格大小。实测 31万点 -> 降到约5万点
     height_threshold: 0.3             # 米，Simple Height Filter 下限：只保留 z > 这个值的点（这一
                                         # 帧里 54% 的点挤在 z∈[-0.38,0.22) 这个地面薄层，0.3 能把

@@ -23,6 +23,7 @@ from cluster_detector import (
     _read_pcd,
     detect_clusters,
     height_filter,
+    range_filter,
     remove_bbox_points,
     voxel_downsample,
 )
@@ -124,6 +125,18 @@ def test_voxel_downsample_merges_points_in_same_cell():
     far_points = np.array([[0, 0, 0], [10, 10, 10]])
     down_far = voxel_downsample(far_points, voxel_size=0.2)
     assert down_far.shape[0] == 2
+
+
+def test_range_filter_keeps_points_within_horizontal_radius():
+    points = np.array([
+        [0, 0, 20],
+        [60, 80, 0],
+        [100.1, 0, 0],
+        [0, -101, 0],
+    ], dtype=float)
+    filtered = range_filter(points, max_range=100.0)
+    assert filtered.shape[0] == 2
+    assert np.allclose(filtered, [[0, 0, 20], [60, 80, 0]])
 
 
 def test_height_filter_keeps_only_points_above_threshold():
@@ -307,6 +320,23 @@ def test_detect_clusters_flatness_filter_drops_thin_structures():
     assert np.allclose(candidates[0].centroid, [20, 20, 1.0], atol=1.0)
 
 
+def test_detect_clusters_range_filter_drops_far_candidate():
+    rng = np.random.default_rng(77)
+    near_cluster = rng.normal(loc=[20, 20, 1], scale=0.2, size=(80, 3))
+    far_cluster = rng.normal(loc=[120, 0, 1], scale=0.2, size=(80, 3))
+    all_points = np.vstack([near_cluster, far_cluster])
+    cfg = dict(_BASE_CFG)
+    cfg["max_detection_range"] = 100.0
+
+    with tempfile.TemporaryDirectory() as tmp:
+        pcd_path = Path(tmp) / "scene.pcd"
+        _write_ascii_pcd(pcd_path, all_points)
+        candidates = detect_clusters(str(pcd_path), [], cfg)
+
+    assert len(candidates) == 1, f"100m 范围外的候选应该被过滤，实际 {len(candidates)}"
+    assert np.allclose(candidates[0].centroid, [20, 20, 1], atol=1.0)
+
+
 def test_detect_clusters_height_filter_removes_ground_band():
     rng = np.random.default_rng(99)
     # "地面"：大量落在 z < 0.3 的密集点，铺满一大片区域，没有被任何 BBox 覆盖
@@ -334,6 +364,7 @@ def main() -> None:
         test_remove_bbox_points_rotated,
         test_read_pcd_ascii_and_binary_match,
         test_voxel_downsample_merges_points_in_same_cell,
+        test_range_filter_keeps_points_within_horizontal_radius,
         test_height_filter_keeps_only_points_above_threshold,
         test_height_filter_upper_bound_drops_tall_points,
         test_detect_clusters_end_to_end,
@@ -344,6 +375,7 @@ def main() -> None:
         test_merge_nearby_candidates_rejects_linear_shape_after_merge,
         test_detect_clusters_merges_fragmented_structure,
         test_detect_clusters_flatness_filter_drops_thin_structures,
+        test_detect_clusters_range_filter_drops_far_candidate,
         test_detect_clusters_height_filter_removes_ground_band,
     ]
     for test in tests:

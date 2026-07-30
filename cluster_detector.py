@@ -17,6 +17,9 @@ rule_report.csv，两者职责分开）：
     Residual Point Cloud（剩余点云）
      |
      v
+    range_filter()：只保留 LiDAR 周围 max_detection_range 米水平半径内的点
+     |
+     v
     voxel_downsample()：体素降采样，纯粹减少点数，不做任何"是不是地面"的语义判断
      |
      v
@@ -251,6 +254,18 @@ def voxel_downsample(points: np.ndarray, voxel_size: float) -> np.ndarray:
     return out
 
 
+def range_filter(points: np.ndarray, max_range: float | None = None) -> np.ndarray:
+    """距离过滤：只保留 LiDAR 周围 max_range 米水平半径内的点。
+
+    这里使用 XY 平面距离 sqrt(x^2 + y^2)，不把 z 算进去；高度范围由
+    height_filter(height_threshold/max_height) 单独负责。max_range 为空或 <=0 时不启用。
+    """
+    if points.shape[0] == 0 or max_range is None or max_range <= 0:
+        return points
+    xy_distance = np.sqrt(points[:, 0] ** 2 + points[:, 1] ** 2)
+    return points[xy_distance <= max_range]
+
+
 def height_filter(points: np.ndarray, height_threshold: float, max_height: float | None = None) -> np.ndarray:
     """简单高度过滤：只保留 height_threshold < z（< max_height，如果给了的话）的点。
 
@@ -370,8 +385,8 @@ def detect_clusters(pcd_path: str, boxes: list[OrientedBox], config: dict) -> li
         pcd_path: assets_downloader.py 下载下来的本地 PCD 文件路径
                   （例如 assets/scene_xxx/frame_0011/pointcloud.pcd）
         boxes:    这一帧全部 BBox 转换成的 OrientedBox 列表（调用方负责从 bbox_data.csv 转换）
-        config:   config.yaml -> cluster_detector 这个子配置块（voxel_size/height_threshold/
-                  max_height/eps/min_points/bbox_margin/merge_distance/max_merged_extent/
+        config:   config.yaml -> cluster_detector 这个子配置块（max_detection_range/voxel_size/
+                  height_threshold/max_height/eps/min_points/bbox_margin/merge_distance/max_merged_extent/
                   min_cluster_point_count/min_cluster_volume/max_cluster_volume/min_flatness）
     """
     points = _read_pcd(pcd_path)
@@ -383,10 +398,15 @@ def detect_clusters(pcd_path: str, boxes: list[OrientedBox], config: dict) -> li
     if residual.shape[0] == 0:
         return []
 
+    max_detection_range = config.get("max_detection_range")
+    ranged = range_filter(residual, max_detection_range)
+    if ranged.shape[0] == 0:
+        return []
+
     # 真实点云（30万级）实测过，跳过这两步直接对 residual 跑 DBSCAN 会内存溢出——
     # 地面点密度太高，见模块开头的说明。这两步是必须的，不是可选优化。
     voxel_size = config.get("voxel_size", 0.2)
-    downsampled = voxel_downsample(residual, voxel_size)
+    downsampled = voxel_downsample(ranged, voxel_size)
     if downsampled.shape[0] == 0:
         return []
 
