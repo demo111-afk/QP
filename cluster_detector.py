@@ -2,8 +2,8 @@
 cluster_detector.py
 点云聚类候选检测——Phase 2：漏标（Missing Annotation）检测的核心模块。
 
-流程（本模块负责 PCD 读取 -> BBox 内部点剔除 -> 降采样/高度过滤 -> DBSCAN -> 噪声过滤
--> 候选层面合并这几步；调用方 rule_engine.py 负责把结果写进 rule_report.csv，两者职责分开）：
+流程是两级聚类（本模块负责全部这几步；调用方 rule_engine.py 负责把结果写进
+rule_report.csv，两者职责分开）：
 
     PCD
      |
@@ -24,14 +24,18 @@ cluster_detector.py
      |    （这不是完整 Ground Removal——没有 RANSAC/平面拟合/CSF/Patchwork++，
      |     只是点云预处理，目的仅仅是让 DBSCAN 的输入规模降到能跑得动）
      v
-    DBSCAN（sklearn.cluster.DBSCAN，只用 x/y/z，不用 intensity）
-     |
+    第一次 DBSCAN（eps 较小，只用 x/y/z，不用 intensity）：精细但容易把一个真实物体
+     |    因为遮挡/稀疏回波/BBox 裕量削点等原因切成好几个局部碎片——这是刻意的代价，
+     |    不是参数没调好，避免把两个真实独立的物体粘连成一个。
      v
-    过滤噪声（点数 / AABB 体积）
-     |
+    宽松初筛：只丢弃 DBSCAN 自己判定的噪声（-1），不做任何点数/体积/扁平度判断——
+     |    严格几何过滤放到第二次聚类合并之后，避免在合并前就误杀本该合并的碎片。
      v
-    _merge_nearby_candidates()：质心距离很近的候选合并成一条（同一个真实结构如果内部有
-     |    空隙，容易被 DBSCAN 切成好几个碎片，这一步把它们拼回一个），纯几何操作，不判断类别
+    第二次 Cluster-level 聚类（_merge_nearby_candidates）：按碎片 AABB 在 XY 平面上的
+     |    最近距离合并（不是质心距离，也不看 Z 重叠——灯塔/场桥/岸桥这类高瘦结构不同
+     |    高度的碎片本该合并）。合并后用真实点重新计算 point_count/centroid/AABB/
+     |    volume/flatness（PCA 特征值），统一跑一轮严格过滤（含合并后整体尺寸上限，
+     |    挡住链式合并出的不合理结果），不管候选是不是被合并过都要过这一关。
      v
     ClusterCandidate 列表（status 固定是 "Possible Missing Annotation" 或
     "Suspicious Residual Cluster"，不判断类别、不调用 Vision/LLM）
@@ -119,6 +123,69 @@ class ClusterCandidate:
     bbox_hint: dict | None = None    # 残留点的轴对齐包围盒：{"min":.., "max":.., "size":..}
     status: str = ""                  # "Possible Missing Annotation" | "Suspicious Residual Cluster"
     merged_fragment_count: int = 1     # 由几个原始 DBSCAN 碎片合并而来；1 表示没有被合并过
+
+
+@dataclass
+class _Fragment:
+    """第一次 DBSCAN 产出的一个原始局部碎片（内部使用，不对外暴露）。只记录必要的
+    几何信息（AABB）供第二次聚类判断要不要合并，不在这一步做任何点数/体积/扁平度过滤。"""
+    label: int
+    indices: np.ndarray   # 在 filtered_points 里的行索引
+    mins: np.ndarray
+    maxs: np.ndarray
+
+
+def _pairwise_xy_gap_matrix(mins: np.ndarray, maxs: np.ndarray) -> np.ndarray:
+    """算 N 个 AABB 两两之间在 XY 平面上的最近距离（重叠记为 0），返回 (N, N) 距离矩阵。
+
+    故意只看 X/Y，不看 Z——像灯塔/场桥/岸桥这类真实高瘦结构，不同高度的碎片
+    水平投影往往重合，但 Z 跨度可能有好几米，用 3D 距离反而会把这些本该合并的
+    同一物体的上下碎片挡在外面。
+    """
+    mins_xy = mins[:, :2]
+    maxs_xy = maxs[:, :2]
+    gap = np.maximum(
+        0.0,
+        np.maximum(
+            mins_xy[:, None, :] - maxs_xy[None, :, :],
+            mins_xy[None, :, :] - maxs_xy[:, None, :],
+        ),
+    )
+    return np.sqrt((gap ** 2).sum(axis=2))
+
+
+def _shape_features(points: np.ndarray) -> tuple[float, float]:
+    """算一个点集的体积（AABB）和形状扁平度。
+
+    扁平度用 PCA 特征值算：对点集做协方差矩阵特征分解，得到 λ1≥λ2≥λ3。
+    linearity = (λ1-λ2)/λ1，接近 1 说明点云主要沿一个方向延展（像一根线/杆）；
+    planarity = (λ2-λ3)/λ1，接近 1 说明点云基本躺在一个平面上（像一面墙/薄片）；
+    flatness = 1 - max(linearity, planarity)，越接近 1 越像"敦实"的三维物体
+    （三个方向的延展程度比较接近），越接近 0 越像退化的线状/面状结构。
+
+    这比单纯用"AABB 最短边/最长边"更准——一根斜着放置、没有对齐坐标轴的杆，
+    AABB 在 x/y 上可能看起来差不多方正，但 PCA 能正确识别出它其实是线状的。
+    """
+    mins = points.min(axis=0)
+    maxs = points.max(axis=0)
+    size = maxs - mins
+    volume = float(size[0] * size[1] * size[2])
+
+    if len(points) < 3:
+        return volume, 0.0   # 点太少，PCA 不稳定，保守地当作最扁处理
+
+    centered = points - points.mean(axis=0)
+    cov = (centered.T @ centered) / len(points)
+    eigenvalues = np.linalg.eigvalsh(cov)   # 升序返回：lam3 <= lam2 <= lam1
+    lam3, lam2, lam1 = eigenvalues
+
+    if lam1 <= 1e-12:
+        return volume, 0.0
+
+    linearity = (lam1 - lam2) / lam1
+    planarity = (lam2 - lam3) / lam1
+    flatness = 1.0 - max(linearity, planarity)
+    return volume, float(flatness)
 
 
 def _euler_xyz_to_matrix(rx: float, ry: float, rz: float) -> np.ndarray:
@@ -294,17 +361,18 @@ def _read_pcd(pcd_path: str) -> np.ndarray:
 
 
 def detect_clusters(pcd_path: str, boxes: list[OrientedBox], config: dict) -> list[ClusterCandidate]:
-    """对一份 PCD 文件跑 Remove BBox Points + DBSCAN + 噪声过滤，返回候选聚类列表。
+    """两级聚类：第一次 DBSCAN 精细分割（容易把一个真实物体拆成多个局部碎片），
+    第二次按碎片 AABB 的 XY 距离做 Cluster-level 合并，合并后统一做一轮严格几何复检。
 
-    不判断类别、不调用 Vision/LLM——每个候选只有几何信息（点数/质心/AABB）和一个固定的
-    status 字符串。
+    不判断类别、不调用 Vision/LLM——每个候选只有几何信息（点数/质心/AABB/形状）和一个
+    固定的 status 字符串。
 
         pcd_path: assets_downloader.py 下载下来的本地 PCD 文件路径
                   （例如 assets/scene_xxx/frame_0011/pointcloud.pcd）
         boxes:    这一帧全部 BBox 转换成的 OrientedBox 列表（调用方负责从 bbox_data.csv 转换）
         config:   config.yaml -> cluster_detector 这个子配置块（voxel_size/height_threshold/
-                  max_height/eps/min_points/bbox_margin/min_cluster_point_count/
-                  min_cluster_volume/max_cluster_volume/min_flatness/merge_distance）
+                  max_height/eps/min_points/bbox_margin/merge_distance/max_merged_extent/
+                  min_cluster_point_count/min_cluster_volume/max_cluster_volume/min_flatness）
     """
     points = _read_pcd(pcd_path)
     if points.shape[0] == 0:
@@ -328,114 +396,117 @@ def detect_clusters(pcd_path: str, boxes: list[OrientedBox], config: dict) -> li
     if filtered_points.shape[0] == 0:
         return []
 
+    # ---- 第一次 DBSCAN：精细分割 ----
     eps = config.get("eps", 0.4)
     min_points = config.get("min_points", 5)
     labels = DBSCAN(eps=eps, min_samples=min_points).fit_predict(filtered_points)
+
+    # 宽松初筛：只丢弃 DBSCAN 自己判定的噪声（-1）。不在这里做任何点数/体积/扁平度
+    # 判断——严格过滤放到合并之后统一执行，避免在合并前就误杀本该合并的碎片。
+    fragments: list[_Fragment] = []
+    for label in sorted(set(labels)):
+        if label == -1:
+            continue
+        member_indices = np.where(labels == label)[0]
+        member_points = filtered_points[member_indices]
+        fragments.append(_Fragment(
+            label=int(label),
+            indices=member_indices,
+            mins=member_points.min(axis=0),
+            maxs=member_points.max(axis=0),
+        ))
+
+    return _merge_nearby_candidates(fragments, filtered_points, config)
+
+
+def _merge_nearby_candidates(
+    fragments: list[_Fragment], filtered_points: np.ndarray, config: dict
+) -> list[ClusterCandidate]:
+    """第二次 Cluster-level 聚类：把可能属于同一个真实实体、但被第一次 DBSCAN 拆开的碎片
+    重新合并，然后对合并结果（不管由 1 个还是多个碎片组成）统一做一轮严格几何复检。
+
+    合并判据：两个碎片的 AABB 在 XY 平面上的最近距离 <= merge_distance（见
+    _pairwise_xy_gap_matrix，不是质心距离，也不看 Z 方向重叠）。实现上复用 DBSCAN——
+    把两两之间的 XY 距离矩阵喂给 metric="precomputed"，min_samples=1 让每个碎片都能
+    自成一组。这个实现仍然具备链式传递性（A-B、B-C 各自在 eps 内会连成一组，即使
+    A-C 相距较远）——不打算消除传递性本身（任何基于连通分量的合并方式都有这个特性），
+    而是靠下面的 max_merged_extent 挡住链式合并出的不合理结果。
+
+    合并后用真实点（不是包围盒角点）重新计算 point_count/centroid/AABB/volume/flatness，
+    再统一跑一次严格过滤——这一轮过滤对"没有被合并、自己单独成一组"的候选同样生效，
+    不是只筛合并后的结果。
+    """
+    if not fragments:
+        return []
 
     min_point_count = config.get("min_cluster_point_count", 15)
     min_volume = config.get("min_cluster_volume", 0.05)
     max_volume = config.get("max_cluster_volume", 200.0)
     min_flatness = config.get("min_flatness", 0.25)
+    max_merged_extent = config.get("max_merged_extent", 30.0)
+
+    if len(fragments) == 1:
+        group_labels = np.array([0])
+    else:
+        mins = np.array([f.mins for f in fragments])
+        maxs = np.array([f.maxs for f in fragments])
+        merge_distance = config.get("merge_distance", 1.5)
+        distance_matrix = _pairwise_xy_gap_matrix(mins, maxs)
+        group_labels = DBSCAN(
+            eps=merge_distance, min_samples=1, metric="precomputed"
+        ).fit_predict(distance_matrix)
 
     candidates: list[ClusterCandidate] = []
-    for label in sorted(set(labels)):
-        if label == -1:
-            continue  # DBSCAN 自己的噪声标签，不是候选
+    for group_label in sorted(set(group_labels)):
+        members = [f for f, g in zip(fragments, group_labels) if g == group_label]
+        group_indices = np.concatenate([m.indices for m in members])
+        group_points = filtered_points[group_indices]
 
-        member_indices = np.where(labels == label)[0]
-        cluster_points = filtered_points[member_indices]
-        point_count = len(cluster_points)
+        point_count = len(group_points)
         if point_count < min_point_count:
             continue
 
-        mins = cluster_points.min(axis=0)
-        maxs = cluster_points.max(axis=0)
-        size = maxs - mins
-        volume = float(size[0] * size[1] * size[2])
+        group_mins = group_points.min(axis=0)
+        group_maxs = group_points.max(axis=0)
+        size = group_maxs - group_mins
+        if size.max() > max_merged_extent:
+            continue  # 合并结果明显不合理（比如链式合并出几十米长），整条丢弃
+
+        volume, flatness = _shape_features(group_points)
         if volume < min_volume or volume > max_volume:
             continue
-
-        # 扁平度 = 包围盒最短边 / 最长边。围栏杆、电缆、薄片状结构件这类明显不是
-        # "敦实"三维物体的候选，比值会很小；数值越接近 1 说明三个方向的尺寸越接近，
-        # 越像人/锥桶/车辆这类目标。纯几何计算，不判断类别。
-        flatness = float(size.min() / size.max()) if size.max() > 0 else 0.0
         if flatness < min_flatness:
             continue
 
-        centroid = cluster_points.mean(axis=0)
+        centroid = group_points.mean(axis=0)
+        merged_fragment_count = len(members)
 
-        # 越靠近噪声过滤阈值边界，越"可疑"——不是分类，只是标出这个候选离阈值有多近，
-        # 供人工判断优先看哪些候选。
-        near_boundary = (
-            point_count < min_point_count * 2
-            or volume < min_volume * 2
-            or volume > max_volume * 0.5
-        )
-        status = "Suspicious Residual Cluster" if near_boundary else "Possible Missing Annotation"
+        if merged_fragment_count > 1:
+            # 多个独立碎片能拼成一个通过所有几何检查的连贯结构，是比单个碎片更强的证据。
+            status = "Possible Missing Annotation"
+        else:
+            # 没有被合并：沿用"离过滤阈值有多近"这套模糊判断，供人工判断优先看哪些候选。
+            near_boundary = (
+                point_count < min_point_count * 2
+                or volume < min_volume * 2
+                or volume > max_volume * 0.5
+            )
+            status = "Suspicious Residual Cluster" if near_boundary else "Possible Missing Annotation"
 
         candidates.append(
             ClusterCandidate(
-                cluster_id=f"cluster_{int(label)}",
-                point_indices=member_indices.tolist(),
+                cluster_id="+".join(f"cluster_{m.label}" for m in members),
+                point_indices=group_indices.tolist(),
                 centroid=tuple(float(v) for v in centroid),
                 point_count=point_count,
                 bbox_hint={
-                    "min": tuple(float(v) for v in mins),
-                    "max": tuple(float(v) for v in maxs),
+                    "min": tuple(float(v) for v in group_mins),
+                    "max": tuple(float(v) for v in group_maxs),
                     "size": tuple(float(v) for v in size),
                 },
                 status=status,
+                merged_fragment_count=merged_fragment_count,
             )
         )
 
-    merge_distance = config.get("merge_distance", 3.0)
-    return _merge_nearby_candidates(candidates, merge_distance)
-
-
-def _merge_nearby_candidates(candidates: list[ClusterCandidate], merge_distance: float) -> list[ClusterCandidate]:
-    """把质心距离很近的候选合并成一条——同一个真实结构（比如镂空的塔架/龙门吊）如果内部
-    有空隙，第一遍 DBSCAN（eps 很小，为了不把相邻但确实不同的物体粘在一起）容易把它切成
-    好几个独立的小碎片。这里不再看原始点，只把每个候选简化成它的质心，对这些质心
-    再跑一次 DBSCAN（复用同一个工具），用一个大得多的 eps（merge_distance，默认 3 米）——
-    质心挨得这么近的候选，大概率是同一个真实物体断裂开的碎片，不是两个独立的东西。
-
-    这一步纯粹是几何操作（质心距离、包围盒并集），不做任何类别判断。合并后的记录直接判定
-    "Possible Missing Annotation"（多个独立碎片能拼成一个连贯结构，是更强的证据，不再用
-    "离阈值多近"那套模糊判断）；没有被合并的候选保持原来的 status 不变。
-    """
-    if len(candidates) <= 1 or merge_distance <= 0:
-        return candidates
-
-    centroids = np.array([c.centroid for c in candidates])
-    group_labels = DBSCAN(eps=merge_distance, min_samples=1).fit_predict(centroids)
-
-    merged: list[ClusterCandidate] = []
-    for group_label in sorted(set(group_labels)):
-        members = [c for c, g in zip(candidates, group_labels) if g == group_label]
-        if len(members) == 1:
-            merged.append(members[0])
-            continue
-
-        total_points = sum(m.point_count for m in members)
-        weighted_centroid = tuple(
-            sum(m.centroid[axis] * m.point_count for m in members) / total_points
-            for axis in range(3)
-        )
-        mins = tuple(min(m.bbox_hint["min"][axis] for m in members) for axis in range(3))
-        maxs = tuple(max(m.bbox_hint["max"][axis] for m in members) for axis in range(3))
-        size = tuple(maxs[axis] - mins[axis] for axis in range(3))
-        merged_indices = [idx for m in members for idx in m.point_indices]
-
-        merged.append(
-            ClusterCandidate(
-                cluster_id="+".join(m.cluster_id for m in members),
-                point_indices=merged_indices,
-                centroid=weighted_centroid,
-                point_count=total_points,
-                bbox_hint={"min": mins, "max": maxs, "size": size},
-                status="Possible Missing Annotation",
-                merged_fragment_count=len(members),
-            )
-        )
-
-    return merged
+    return candidates

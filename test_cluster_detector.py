@@ -16,9 +16,9 @@ from pathlib import Path
 import numpy as np
 
 from cluster_detector import (
-    ClusterCandidate,
     OrientedBox,
     _euler_xyz_to_matrix,
+    _Fragment,
     _merge_nearby_candidates,
     _read_pcd,
     detect_clusters,
@@ -184,55 +184,91 @@ def test_detect_clusters_no_residual_returns_empty():
     assert candidates == []
 
 
-def _make_candidate(cluster_id, centroid, point_count, mins, maxs):
-    size = tuple(maxs[i] - mins[i] for i in range(3))
-    return ClusterCandidate(
-        cluster_id=cluster_id, centroid=centroid, point_count=point_count,
-        bbox_hint={"min": mins, "max": maxs, "size": size}, status="Suspicious Residual Cluster",
-    )
+def _build_fragments(point_groups: list[np.ndarray]) -> tuple[list[_Fragment], np.ndarray]:
+    """把几组点直接拼成 (fragments, filtered_points)，绕开 PCD 文件/第一次 DBSCAN，
+    直接单测 _merge_nearby_candidates（第二次聚类）本身的合并/复检逻辑。"""
+    filtered_points = np.vstack(point_groups)
+    fragments = []
+    offset = 0
+    for i, group in enumerate(point_groups):
+        n = len(group)
+        indices = np.arange(offset, offset + n)
+        fragments.append(_Fragment(label=i, indices=indices, mins=group.min(axis=0), maxs=group.max(axis=0)))
+        offset += n
+    return fragments, filtered_points
 
 
-def test_merge_nearby_candidates_combines_close_centroids():
-    # 两个质心只差 1 米的候选（同一个结构断裂的碎片），应该被合并成 1 条
-    a = _make_candidate("cluster_0", (0.0, 0.0, 0.0), 20, (-0.5, -0.5, -0.5), (0.5, 0.5, 0.5))
-    b = _make_candidate("cluster_1", (1.0, 0.0, 0.0), 30, (0.5, -0.5, -0.5), (1.5, 0.5, 0.5))
-    # 第三个候选离得很远（50米），不应该被卷进来
-    c = _make_candidate("cluster_2", (50.0, 50.0, 50.0), 40, (49.5, 49.5, 49.5), (50.5, 50.5, 50.5))
-
-    merged = _merge_nearby_candidates([a, b, c], merge_distance=3.0)
-
-    assert len(merged) == 2, f"应该合并成 2 条（a+b 合并，c 保持独立），实际 {len(merged)}"
-    combined = next(m for m in merged if m.merged_fragment_count == 2)
-    untouched = next(m for m in merged if m.merged_fragment_count == 1)
-
-    assert combined.point_count == 50, "合并后点数应该是两个碎片相加"
-    # 按点数加权平均：(0*20 + 1*30) / 50 = 0.6
-    assert np.isclose(combined.centroid[0], 0.6)
-    assert combined.bbox_hint["min"] == (-0.5, -0.5, -0.5)
-    assert combined.bbox_hint["max"] == (1.5, 0.5, 0.5), "包围盒应该是两个碎片的并集"
-    assert combined.status == "Possible Missing Annotation"
-
-    assert untouched.cluster_id == "cluster_2"
-    assert untouched.point_count == 40
+# _merge_nearby_candidates 单测用的宽松 config：只关心合并/尺寸/形状判据本身，
+# 点数/体积门槛故意放得很低很宽，不让它们干扰这几个测试。
+_MERGE_CFG = {
+    "merge_distance": 1.5, "max_merged_extent": 30.0,
+    "min_cluster_point_count": 5, "min_cluster_volume": 0.0, "max_cluster_volume": 1e6,
+    "min_flatness": 0.0,
+}
 
 
-def test_merge_nearby_candidates_no_op_when_all_far_apart():
-    a = _make_candidate("cluster_0", (0.0, 0.0, 0.0), 20, (-0.5,) * 3, (0.5,) * 3)
-    b = _make_candidate("cluster_1", (100.0, 0.0, 0.0), 30, (99.5, -0.5, -0.5), (100.5, 0.5, 0.5))
-    merged = _merge_nearby_candidates([a, b], merge_distance=3.0)
-    assert len(merged) == 2
-    assert all(m.merged_fragment_count == 1 for m in merged)
+def test_merge_nearby_candidates_combines_xy_close_ignores_z():
+    rng = np.random.default_rng(1)
+    # a、b 的 XY 位置几乎重合，Z 差 8 米（模拟灯塔上下两段断开的碎片）——
+    # 判据故意不看 Z，应该合并。
+    frag_a = rng.normal(loc=[10, 10, 0], scale=0.1, size=(30, 3))
+    frag_b = rng.normal(loc=[10, 10, 8], scale=0.1, size=(30, 3))
+    # c 的 XY 位置离得很远（90 米），不应该被卷进来
+    frag_c = rng.normal(loc=[100, 100, 0], scale=0.1, size=(30, 3))
+
+    fragments, filtered_points = _build_fragments([frag_a, frag_b, frag_c])
+    candidates = _merge_nearby_candidates(fragments, filtered_points, _MERGE_CFG)
+
+    assert len(candidates) == 2, f"a+b 应该合并，c 保持独立，实际 {len(candidates)}"
+    combined = next(c for c in candidates if c.merged_fragment_count == 2)
+    untouched = next(c for c in candidates if c.merged_fragment_count == 1)
+    assert combined.point_count == 60
+    assert untouched.point_count == 30
+
+
+def test_merge_nearby_candidates_xy_far_apart_no_merge():
+    rng = np.random.default_rng(2)
+    frag_a = rng.normal(loc=[0, 0, 0], scale=0.1, size=(30, 3))
+    frag_b = rng.normal(loc=[10, 0, 0], scale=0.1, size=(30, 3))  # XY 距离 10m，远超 merge_distance=1.5
+    fragments, filtered_points = _build_fragments([frag_a, frag_b])
+    candidates = _merge_nearby_candidates(fragments, filtered_points, _MERGE_CFG)
+    assert len(candidates) == 2
+    assert all(c.merged_fragment_count == 1 for c in candidates)
+
+
+def test_merge_nearby_candidates_rejects_oversized_chain_merge():
+    rng = np.random.default_rng(3)
+    # 模拟一排间距 1.2m 的围栏立柱：相邻两根的 XY 间隙都在 merge_distance=1.5 内，
+    # 会链式合并成一整条（这正是链式传递性的体现，不打算消除），但整排跨度约 22.8m，
+    # 超过 max_merged_extent=15，应该被整体丢弃。
+    posts = [rng.normal(loc=[i * 1.2, 0, 0], scale=0.05, size=(10, 3)) for i in range(20)]
+    fragments, filtered_points = _build_fragments(posts)
+    cfg = dict(_MERGE_CFG)
+    cfg["max_merged_extent"] = 15.0
+    candidates = _merge_nearby_candidates(fragments, filtered_points, cfg)
+    assert candidates == [], f"链式合并结果超过尺寸上限，应该整体丢弃，实际保留了 {len(candidates)} 条"
+
+
+def test_merge_nearby_candidates_rejects_linear_shape_after_merge():
+    rng = np.random.default_rng(4)
+    # 4 个各自还算敦实的小碎片，沿一条直线排开、彼此间隙都在 merge_distance 内会合并，
+    # 但合并后整体点云呈线状——用来验证"合并后重新算 flatness"这一步真的在起作用
+    # （如果只在合并前检查扁平度，这几个小圆球状碎片各自都能轻松通过）。
+    blobs = [rng.normal(loc=[i * 1.0, 0, 0], scale=0.15, size=(20, 3)) for i in range(4)]
+    fragments, filtered_points = _build_fragments(blobs)
+    cfg = dict(_MERGE_CFG)
+    cfg["min_flatness"] = 0.3
+    candidates = _merge_nearby_candidates(fragments, filtered_points, cfg)
+    assert candidates == [], f"合并后呈线状，应该被扁平度过滤挡掉，实际保留了 {len(candidates)} 条"
 
 
 def test_detect_clusters_merges_fragmented_structure():
     rng = np.random.default_rng(123)
     # 一个真实结构因为内部有空隙，被切成两段紧挨着的点云（间距略大于 eps=0.4，
-    # 第一遍 DBSCAN 会把它们分成 2 个独立候选），但两段质心相距不到 1 米，
-    # 应该被 merge_distance=3.0 这一步重新合并成 1 条。
+    # 第一遍 DBSCAN 会把它们分成 2 个独立候选），但两段 XY 位置几乎重合、只是 Z 差 1.5m
+    # （模拟灯塔上下两段），应该被第二次聚类重新合并成 1 条——判据故意不看 Z 差距。
     fragment_1 = rng.normal(loc=[10, 10, 5.0], scale=0.05, size=(60, 3))
-    fragment_2 = rng.normal(loc=[10, 10, 6.5], scale=0.05, size=(60, 3))  # 跟 fragment_1 隔 1.5m
-    # 间距 1.5m 明显大于 DBSCAN 第一遍的 eps=0.4，两段会先被分成 2 个独立候选，
-    # 再靠 merge_distance=3.0 这一步重新拼回 1 条。
+    fragment_2 = rng.normal(loc=[10, 10, 6.5], scale=0.05, size=(60, 3))
     all_points = np.vstack([fragment_1, fragment_2])
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -302,8 +338,10 @@ def main() -> None:
         test_height_filter_upper_bound_drops_tall_points,
         test_detect_clusters_end_to_end,
         test_detect_clusters_no_residual_returns_empty,
-        test_merge_nearby_candidates_combines_close_centroids,
-        test_merge_nearby_candidates_no_op_when_all_far_apart,
+        test_merge_nearby_candidates_combines_xy_close_ignores_z,
+        test_merge_nearby_candidates_xy_far_apart_no_merge,
+        test_merge_nearby_candidates_rejects_oversized_chain_merge,
+        test_merge_nearby_candidates_rejects_linear_shape_after_merge,
         test_detect_clusters_merges_fragmented_structure,
         test_detect_clusters_flatness_filter_drops_thin_structures,
         test_detect_clusters_height_filter_removes_ground_band,
