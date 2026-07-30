@@ -100,6 +100,22 @@ def test_synthetic_cluster_projects_to_source_camera():
     assert y1 < 240 < y2
 
 
+def test_projection_roi_scales_to_actual_asset_image_size():
+    with tempfile.TemporaryDirectory() as tmp:
+        image_path = Path(tmp) / "cam_front_mid.jpg"
+        Image.new("RGB", (320, 240), color=(10, 10, 10)).save(image_path)
+        roi = project_cluster_to_camera(_cluster(), _camera(), image_path)
+
+    assert roi is not None
+    assert roi.calibration_image_size == (640, 480)
+    assert roi.target_image_size == (320, 240)
+    x1, y1, x2, y2 = roi.roi
+    assert 125 <= x1 < 160
+    assert 160 < x2 <= 195
+    assert 85 <= y1 < 120
+    assert 120 < y2 <= 155
+
+
 def test_save_projection_debug_images():
     manager = CalibrationManager(cameras=(_camera("camera0", "front_mid", extrinsic=True),))
     with tempfile.TemporaryDirectory() as tmp:
@@ -120,6 +136,7 @@ def main() -> None:
         test_cluster_behind_camera_is_not_visible,
         test_asset_camera_matching_prefers_camera_with_extrinsic_then_low_id,
         test_synthetic_cluster_projects_to_source_camera,
+        test_projection_roi_scales_to_actual_asset_image_size,
         test_save_projection_debug_images,
     ]
     for test in tests:

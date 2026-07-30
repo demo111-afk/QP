@@ -87,6 +87,8 @@ def make_synthetic_cluster_for_camera(camera: CameraCalibration, size_m: float =
 
     This is only for validating projection/debug-image plumbing when the local
     calibration and asset images are known to come from different scenes.
+    The observed extrinsic matrix is camera-to-lidar/world, so synthetic camera
+    points are transformed forward into the cluster/world coordinate frame.
     """
     if camera.extrinsic is None:
         raise ValueError(f"Camera {camera.camera_id} has no extrinsic")
@@ -102,10 +104,9 @@ def make_synthetic_cluster_for_camera(camera: CameraCalibration, size_m: float =
         [half, half, depth_m - half],
         [half, half, depth_m + half],
     ], dtype=np.float64)
-    transform = np.asarray(camera.extrinsic.values, dtype=np.float64)
-    inverse = np.linalg.inv(transform)
+    camera_to_world = np.asarray(camera.extrinsic.values, dtype=np.float64)
     homogeneous = np.column_stack([camera_points, np.ones(len(camera_points), dtype=np.float64)])
-    world_points = (inverse @ homogeneous.T).T[:, :3]
+    world_points = (camera_to_world @ homogeneous.T).T[:, :3]
     mins = world_points.min(axis=0)
     maxs = world_points.max(axis=0)
     centroid = world_points.mean(axis=0)
@@ -122,6 +123,15 @@ def make_synthetic_cluster_for_camera(camera: CameraCalibration, size_m: float =
         },
         status="Synthetic Projection Demo",
     )
+
+
+def _filter_clusters_by_distance(clusters: list[ClusterCandidate], min_distance_m: float) -> list[ClusterCandidate]:
+    kept = []
+    for cluster in clusters:
+        center = np.asarray(cluster.centroid, dtype=np.float64)
+        if float(np.linalg.norm(center)) >= min_distance_m:
+            kept.append(cluster)
+    return kept
 
 
 def run_demo(args: argparse.Namespace) -> int:
@@ -161,9 +171,18 @@ def run_demo(args: argparse.Namespace) -> int:
 
         cluster_cfg = ((config.get("rule_engine") or {}).get("cluster_detector") or {})
         clusters = detect_clusters(str(pcd_path), boxes, cluster_cfg)
+        raw_cluster_count = len(clusters)
+        if args.min_cluster_distance > 0:
+            clusters = _filter_clusters_by_distance(clusters, args.min_cluster_distance)
+            skipped = raw_cluster_count - len(clusters)
+            print(
+                f"[Projection Demo] residual clusters after min-distance filter: {len(clusters)} "
+                f"(skipped {skipped} closer than {args.min_cluster_distance:g}m)"
+            )
+        else:
+            print(f"[Projection Demo] residual clusters: {len(clusters)}")
         if args.max_clusters > 0:
             clusters = clusters[:args.max_clusters]
-        print(f"[Projection Demo] residual clusters: {len(clusters)}")
 
     for i, cluster in enumerate(clusters):
         print(
@@ -198,6 +217,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--bbox-csv", default=None)
     parser.add_argument("--max-clusters", type=int, default=20)
+    parser.add_argument(
+        "--min-cluster-distance",
+        type=float,
+        default=0.0,
+        help="Only for projection/debug demo: skip residual clusters whose centroid is closer than this many meters.",
+    )
     parser.add_argument("--synthetic-demo", action="store_true")
     return parser.parse_args()
 

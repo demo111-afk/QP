@@ -29,6 +29,8 @@ class ProjectedROI:
     visible_points: int
     total_points: int
     clipped: bool
+    calibration_image_size: tuple[int, int] | None = None
+    target_image_size: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -87,9 +89,10 @@ def project_cluster_to_camera(
 ) -> ProjectedROI | None:
     """Project one cluster AABB hint to one camera and return a clipped ROI.
 
-    This uses camera.extrinsic as the lidar/world-to-camera transform and camera
-    intrinsic as the 3x3 pinhole matrix. Distortion is preserved in calibration
-    data but intentionally not applied here; this stage creates the Projection
+    The observed calibration stores camera.extrinsic as camera-to-lidar/world,
+    so projection uses its inverse as the lidar/world-to-camera transform. The
+    camera intrinsic is then applied as the 3x3 pinhole matrix. Distortion is
+    preserved in calibration data but intentionally not applied here; this stage creates the Projection
     infrastructure and debug ROI, not final pixel-perfect geometry.
     """
     if camera.extrinsic is None or camera.intrinsic is None or camera.image_size is None:
@@ -102,7 +105,10 @@ def project_cluster_to_camera(
     if pixels.size == 0:
         return None
 
-    width, height = camera.image_size.width, camera.image_size.height
+    calibration_size = (camera.image_size.width, camera.image_size.height)
+    target_size = _target_image_size(image_path, calibration_size)
+    pixels = _scale_pixels_to_target_image(pixels, calibration_size, target_size)
+    width, height = target_size
     x_min, y_min = pixels.min(axis=0)
     x_max, y_max = pixels.max(axis=0)
 
@@ -132,6 +138,8 @@ def project_cluster_to_camera(
         visible_points=visible_count,
         total_points=len(corners),
         clipped=clipped,
+        calibration_image_size=calibration_size,
+        target_image_size=target_size,
     )
 
 
@@ -146,8 +154,12 @@ def project_points(
 
     points = np.asarray(points_xyz, dtype=np.float64)
     homogeneous = np.column_stack([points, np.ones(points.shape[0], dtype=np.float64)])
-    transform = np.asarray(camera.extrinsic.values, dtype=np.float64)
-    camera_points = (transform @ homogeneous.T).T[:, :3]
+    camera_to_world = np.asarray(camera.extrinsic.values, dtype=np.float64)
+    try:
+        world_to_camera = np.linalg.inv(camera_to_world)
+    except np.linalg.LinAlgError:
+        return np.empty((0, 2), dtype=np.float64), 0
+    camera_points = (world_to_camera @ homogeneous.T).T[:, :3]
 
     valid = camera_points[:, 2] > min_depth
     if not np.any(valid):
@@ -232,6 +244,35 @@ def _camera_match_sort_key(camera: CameraCalibration) -> tuple[int, int, str]:
 def _camera_numeric_suffix(camera_id: str) -> int:
     match = __import__("re").search(r"(\d+)$", camera_id)
     return int(match.group(1)) if match else 10**9
+
+
+def _target_image_size(image_path: str | Path | None, calibration_size: tuple[int, int]) -> tuple[int, int]:
+    if image_path is None:
+        return calibration_size
+    try:
+        with Image.open(image_path) as image:
+            return image.size
+    except OSError:
+        return calibration_size
+
+
+def _scale_pixels_to_target_image(
+    pixels: np.ndarray,
+    calibration_size: tuple[int, int],
+    target_size: tuple[int, int],
+) -> np.ndarray:
+    if calibration_size == target_size:
+        return pixels
+
+    calibration_width, calibration_height = calibration_size
+    target_width, target_height = target_size
+    if calibration_width <= 0 or calibration_height <= 0:
+        return pixels
+
+    scaled = pixels.copy()
+    scaled[:, 0] *= target_width / calibration_width
+    scaled[:, 1] *= target_height / calibration_height
+    return scaled
 
 
 def _debug_color(index: int) -> tuple[int, int, int]:
