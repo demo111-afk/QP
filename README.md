@@ -331,39 +331,65 @@ python cleanup_scene.py --dry-run     # 只看会删哪些文件，不会真的�
 ```
 qp_copilot/
 ├── ui_app.py / ui_app.pyw   # 桌面 UI（推荐入口），子进程调用 main.py / cleanup_scene.py
-├── main.py                    # 抓取阶段入口：切帧 + 就绪等待 + 截图 + 网络记录 + BBox 提取
-├── rule_engine.py                # 质检规则引擎：读 bbox_data.csv 跑规则
-├── cleanup_scene.py                 # 按 scene_id 清理 outputs/ 下的本地文件
+├── main.py                    # 主流程入口：切帧 + 就绪等待 + 截图 + 网络记录 + BBox 提取 + Assets 下载 + Rule Engine
+├── rule_engine.py                # 质检规则引擎：读 bbox_data.csv / assets/ 运行规则，生成 rule_report.csv / rule_summary.json
+├── cleanup_scene.py                 # 按 scene_id 清理 outputs/ 和根级 assets/ 下的本地文件
 ├── analyze.py                          # 旧版分析入口：读 capture_report.csv，见第 6 节
-├── browser.py / navigator.py / frame_ready.py / capture.py / network_recorder.py
-│                                          # 浏览器连接、切帧、就绪判断、截图、网络记录
+├── browser.py / navigator.py / frame_ready.py / capture.py / network_recorder.py / assets_downloader.py
+│                                          # 浏览器连接、切帧、就绪判断、截图、网络记录、Assets 下载
 ├── bbox_probe.py / bbox_extractor.py         # BBox 广撒网探测 / 针对性提取
+├── cluster_detector.py                            # 漏标候选检测：PCD 残余点云两级聚类
+├── vehicle_dimension_config.py                     # 尺寸参考库读取与 Reference Size + Tolerance 判断
+├── config/vehicle_dimensions.yaml                  # 车辆/设施/人员等类别的尺寸参考库
+├── vision_classifier.py                            # 视觉分类接口占位，当前不调用模型
 ├── report.py / analyzers.py                     # capture_report.csv 读写 + 旧版分析框架
+├── test_assets_downloader.py / test_cluster_detector.py
+│                                          # Assets 采样逻辑和 Cluster Pipeline 的独立测试
 ├── config.yaml                                     # 所有可调参数
 ├── requirements.txt / README.md
+├── assets/                         # PCD/JPG 文件本体：assets/scene_<scene_id>/frame_NNNN/
 └── outputs/
     ├── screenshots/    # 每帧截图
-    ├── assets/         # 保留目录（本版本不使用）
+    ├── assets/         # 旧保留目录
     └── reports/         # 见第 2 节「输出文件一览」
 ```
 
 ---
 
-## 9. 后续规划（不在第一版范围内）
+## 9. 当前错标 / 漏标能力边界
 
-- 接入 AI 视觉模型：结合截图做画面级别的标注问题识别（漏标、错标、类别错误等
-  BBox 几何数据本身看不出来的问题）。
+当前项目已经接入两类 Phase 2 几何规则，但仍然不是完整 AI 质检系统：
+
+- **错标 / 尺寸异常：`DimensionMismatch`**
+  - 数据库：`config/vehicle_dimensions.yaml`
+  - 读取接口：`vehicle_dimension_config.py`
+  - 判断方式：`reference_size × (1 ± tolerance)`，不是手写固定 min/max。
+  - Rule Engine 使用 `scale_x/y/z -> length/width/height`，按 className 查尺寸库。
+  - 对一个 className 有多个变体的类别（例如托架/平板车/自身拖挂车），默认
+    `multi_variant_strategy: any_variant`：落在任一变体容差范围内即认为尺寸可接受。
+  - 缺少参考尺寸、`no_fixed_value`、未知类别会跳过，不编造判断。
+
+- **漏标候选：`PossibleMissingAnnotation`**
+  - 读取 `assets_downloader.py` 已下载的本地 PCD：
+    `assets/scene_<scene_id>/frame_NNNN/pointcloud.pcd`
+  - 只覆盖已经下载 PCD 的帧，所以受 `assets.sample_interval` 影响；BBox 采集和其它规则仍跑完整帧。
+  - 流程：PCD -> 删除已有 BBox 内点 -> Voxel Downsample -> Height Filter ->
+    第一次点级 DBSCAN -> 第二次 Cluster-level Merge -> 重新计算几何/PCA 形状特征 ->
+    几何过滤 -> 写入统一 `rule_report.csv`。
+  - Cluster 只输出可疑残余点云候选，不识别类别，不调用 Vision/LLM。
+
+这些能力已经进入 `rule_engine.enabled_rules`，结果统一写入 `rule_report.csv` /
+`rule_summary.json`。但整体项目仍未完成 AI 视觉分类、截图裁剪、多模态复核等后续能力。
 
 ---
 
-## 10. AI Quality Inspection Phase 1 —— Assets 基础设施（新增）
+## 10. Assets / Cluster / 尺寸库现状
 
-**这一阶段不是实现 AI，只是给后续 AI 判断准备数据基础**。BBox 采集 / Rule Engine /
-Report / UI 保持第一版逻辑完全不变，以下是新增的部分：
+**Assets 下载已经是当前主流程的一部分，但只服务于本地质检，不修改 QP 平台数据。**
 
 - **`assets_downloader.py`**：Assets（PCD + JPG 文件本体）下载器。复用 `network_recorder.py`
   已经监听、按帧分组好的 URL（不新增浏览器监听），通过当前已登录的浏览器 context 下载文件。
-  受 `config.yaml` 里新增的 `assets` 配置块控制：
+  受 `config.yaml` 里的 `assets` 配置块控制：
   - `assets.enabled`：总开关，关掉完全不影响现有任何功能。
   - `assets.sample_interval`：每隔多少帧下载一次 PCD/JPG 文件本体（只影响 Assets 下载数量，
     不影响 BBox 采集/Rule Engine/Report——那几个仍然跑完整 `frame_count`）。例如 81 帧、
@@ -381,13 +407,9 @@ Report / UI 保持第一版逻辑完全不变，以下是新增的部分：
 - **`test_assets_downloader.py`**：`sample_interval` 选帧逻辑的独立测试，`python
   test_assets_downloader.py` 直接跑，不需要额外安装测试框架。
 - **`config/vehicle_dimensions.yaml` + `vehicle_dimension_config.py`**：车辆/物体尺寸参考库
-  （Person/Cone/Forklift/Truck/Trailer/Container/AGV，尺寸先留空 `null`，后续补真实数据）。
-  提供 `load()` / `get_dimension()` / `check_dimension()` 接口，**本阶段不接入 Rule Engine**，
-  是独立模块。
-- **`cluster_detector.py`** / **`vision_classifier.py`**：分别是点云聚类候选检测、视觉分类
-  的接口占位（`NotImplementedError`），供后续阶段实现，本阶段不跑任何算法/模型。
-
-**注意**：`cleanup_scene.py` 目前扫描的是 `outputs/reports|screenshots|assets`（`outputs/`
-下那个保留目录），**不会**扫描到新增的根级 `assets/scene_*/` 目录，清理某个 scene 时不会
-连带删除已下载的 Assets——这是已知的待办事项，不在本阶段范围内。
-
+  已经接入 `DimensionMismatch`，提供 `load()` / `get_dimension()` / `check_dimension()` 接口。
+- **`cluster_detector.py`**：已经实现 PCD 读取、BBox 内点删除、预处理、两级聚类、PCA 形状过滤，
+  并通过 `PossibleMissingAnnotation` 写入现有 Rule Report。
+- **`vision_classifier.py`**：仍是接口占位，当前不调用任何模型/API。
+- **`cleanup_scene.py`**：现在会同时扫描 `outputs/reports`、`outputs/screenshots`、
+  `outputs/assets` 以及根级 `assets/scene_<scene_id>/` 下的文件。
