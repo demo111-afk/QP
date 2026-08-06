@@ -1,415 +1,727 @@
-# QP Copilot（第一版）
+# QP Copilot V2.0
 
-内部工具：自动浏览 QP 平台某个 scene 的多帧数据，逐帧切帧、等待真正加载完成、截图保存、
-记录网络请求、提取 BBox 几何数据，并跑一遍质检规则引擎，生成本地报告。
+QP Copilot 是用于自动驾驶标注质检的桌面辅助工具，检查范围包括漏标、错标以及跨帧一致性、
+轨迹连续性、尺寸异常和空帧等规则。用户在 UI 中输入 Scene Number、Frame Count，粘贴
+LiDAR-Camera Calibration YAML，然后点击 **Start Inspection**。程序复用已登录的 Edge 浏览器会话，
+自动完成 BBox 采集、PCD/JPG 下载、规则检查、Residual Cluster、相机投影、Qwen Vision 复核和
+统一报告生成。
 
-**不做的事**：不接 AI 视觉模型、**不自动点击"合格/驳回/提交"、不修改平台任何数据**。
-本工具只做只读的事：**切帧、等待就绪、截图、记录网络请求、提取 BBox、跑质检规则、生成本地报告**。
+最终质检结论只写入：
 
----
+- `outputs/reports/rule_report.csv`
+- `outputs/reports/rule_summary.json`
 
-## 1. 依赖与环境配置：Windows / Ubuntu（`cdp` 调试模式）
-
-脚本连接你手动打开、已登录好的浏览器，**账号密码全程不经过脚本，也不会被保存**。
-Edge 和 Chrome 都是 Chromium 内核，走一样的调试协议，两个都能用。按你实际使用的系统
-选对应小节。
-
-### 1.1 Windows 配置与运行
-
-1. 安装依赖
-
-   ```bash
-   cd qp_copilot
-   pip install -r requirements.txt
-   playwright install chromium
-   ```
-
-   桌面 UI（`ui_app.py`）用的是 Python 自带的 `tkinter`，不需要额外安装。
-
-2. **完全关闭**所有已打开的浏览器窗口（调试端口只能在启动时指定）。
-3. 用调试端口重新启动浏览器：
-
-   **Edge**（实际在用的）：
-   ```powershell
-   & "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --remote-debugging-port=9222 --user-data-dir="C:\edge-qp-debug"
-   ```
-
-   **Chrome**（如果用 Chrome 就用这个）：
-   ```powershell
-   & "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="C:\chrome-qp-debug"
-   ```
-
-   `--user-data-dir` 用一个独立目录，避免和日常浏览器资料冲突，首次要重新登录一次。
-
-4. 在这个新打开的窗口里：
-   1. 登录 QP 质检网站
-   2. 打开要检查的 scene，进入点云查看页面
-   3. **停在第 1 帧**
-5. 确认 `config.yaml` 里 `browser.mode: "cdp"`、`browser.cdp_url` 跟实际端口一致
-   （默认 `http://127.0.0.1:9222`，用上面的命令不用改）。
-
-   如果 `cdp` 模式连不上（比如公司网络策略限制了调试端口），把 `browser.mode` 改成
-   `"launch"`，脚本会自己开一个新浏览器窗口，你在里面手动登录、停在第 1 帧，回终端按 Enter 继续。
-
-**运行**
-
-**双击 `ui_app.pyw`** 直接打开界面。
-
-（`ui_app.py` 和 `ui_app.pyw` 内容完全一样，区别只是双击 `.py` 的话 Windows 会额外弹一个
-黑色命令行窗口跟在 UI 后面，关掉黑框 UI 也会跟着关掉；也可以在终端里运行
-`python ui_app.py`，效果跟双击 `.pyw` 一样。）
-
-前提：浏览器已经按上面步骤启动调试端口、登录、打开目标 scene、停在第 1 帧。
-
-- 填 **Scene Number** / **Frame Count**（留空用 `config.yaml` 默认值），点 **Start Inspection**——
-  实际是在后台起子进程跑 `main.py`，把 scene_id / 帧数 / 确认回车自动喂给它，界面上会显示
-  实时进度条和状态
-- 跑完之后 `bbox_data.csv` / `rule_report.csv` / `rule_summary.json` 三行会变成可点的
-  **Open** 按钮，或者点 **Open Report Folder** 直接打开整个报告目录
-- **Cleanup Scene** 区域：填 Scene Number，点 **Delete Scene Files**，弹窗要求输入 `DELETE`
-  二次确认，才会真正调用 `cleanup_scene.py` 删除这个场景的本地文件
-
-UI 本身不重新实现任何业务逻辑，只是把 `main.py` / `cleanup_scene.py` 当成两个可执行脚本调用
-（子进程 + stdin），跟你在终端里手动运行完全一样。
-
-### 1.2 Ubuntu 配置与启动
-
-
-
-**第一次配置（仅需一次）**
-
-1. 安装系统依赖
-
-   ```bash
-   sudo apt update
-   sudo apt install -y python3-pip python3-venv python3-tk
-   ```
-
-2. 进入项目目录
-
-   ```bash
-   cd ~/Downloads/QP-copilot-main
-   ```
-
-3. 创建虚拟环境
-
-   ```bash
-   python3 -m venv .venv
-   ```
-
-4. 激活虚拟环境
-
-   ```bash
-   source .venv/bin/activate
-   ```
-
-5. 安装项目依赖
-
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-   如果下载失败，可执行 `pip cache purge` 后重新安装：
-
-   ```bash
-   pip install --no-cache-dir -r requirements.txt
-   ```
-
-**每次使用**
-
-1. 启动 Edge（调试模式）
-
-   ```bash
-   microsoft-edge-stable \
-     --remote-debugging-port=9222 \
-     --user-data-dir="$HOME/edge-qp-debug"
-   ```
-
-2. 登录 QP：浏览器打开后登录账号、打开需要质检的 Scene、保持浏览器不要关闭
-
-3. 进入项目目录
-
-   ```bash
-   cd ~/Downloads/QP-copilot-main
-   ```
-
-4. 激活虚拟环境
-
-   ```bash
-   source .venv/bin/activate
-   ```
-
-5. 启动程序
-
-   ```bash
-   python ui_app.py
-   ```
+工具只读取 QP 页面并在本地分析，不会点击“合格、驳回、提交”，不会修改平台标注或评审状态。
 
 ---
 
-## 2. 输出文件一览
+## 1. 当前完整流程
 
-全部在 `outputs/reports/`（截图在 `outputs/screenshots/`），文件名固定，每次运行覆盖。
+```text
+打开已登录的 QP Scene 质检页面
+-> 双击桌面 QP Copilot
+-> 输入 Scene Number + Frame Count + Calibration YAML
+-> Start Inspection
+-> 通过 CDP（浏览器远程调试协议）连接 Edge 端口 9222
+-> 从 Frame 2 开始自动切帧、等待资源、采集 BBox
+-> 按 sample_interval 下载 PCD + 5 路 JPG
+-> 普通 Rule Engine
+-> 删除已有 BBox 内点并运行两级 Residual Cluster
+-> Cluster / Existing BBox 投影到可见 Camera
+-> 生成单 Candidate context/crop/manifest
+-> Qwen Vision 漏标与错标复核
+-> 合并全部 RuleFinding
+-> rule_report.csv + rule_summary.json
+```
 
-**最重要的两个、人工质检直接看这两个就够了**：
+UI 显示固定 9 个阶段：
 
-| 文件 | 内容 |
-|---|---|
-| `rule_report.csv` | **质检结论**：每一条规则命中记录（哪个目标、哪一帧、什么问题、`first_frame`/`last_frame`/`occurrence_count` 持续区间），含抓取失败的 `MissingBBox` 记录 |
-| `rule_summary.json` | **质检结论汇总**：总帧数/总 BBox 数/总 warning 数、按 rule_id 分类的命中数、有问题的帧号和目标列表、`missing_bbox_frames`，跑完会直接打印在终端/UI 里，不用打开文件也能先看个大概 |
+1. Loading Configuration
+2. Connecting Edge Browser
+3. Collecting Frames, BBox and Assets
+4. Writing Capture and BBox Data
+5. Running Rule Engine
+6. Running Cluster Detection and Projection
+7. Running Vision Verification
+8. Merging Rules and Writing Final Report
+9. Inspection Finished
 
-其余是采集过程的中间数据/诊断信息，一般不需要单独看，出问题时排查用：
-
-| 文件 | 内容 |
-|---|---|
-| `bbox_data.csv` | 每帧每个框的完整原始字段（位置/朝向/尺寸/身份标识等，见第 4 节），是 `rule_report.csv` 的输入数据 |
-| `capture_report.csv` | 每帧的切帧状态 / 就绪状态 / PCD-JPG 数量 / 截图路径 |
-| `network_assets.csv` | 每帧实际捕获到的 PCD/JPG 请求 URL |
-| `mapping_report.txt` | 这次实际拿到了哪些 BBox 字段、建议用哪个字段做跨帧标识 |
-| `bbox_probe_report.json` | BBox 数据来源的广撒网探测报告（调试用，见第 4 节） |
+单帧、单 Cluster、单 BBox 或单次 Vision 请求失败时会记录错误并继续。只要报告仍可写，整个
+Scene 会继续生成最终报告。
 
 ---
 
-## 3. 切帧：`visible_text_bottom` 模式
+## 2. 运行前准备
 
-全局 `text=数字` 选择器会误匹配页面上其它"长得像帧号"的元素（比如标注对象的
-`track-id`）。现在的做法是三层过滤：**精确文本匹配** → 只留**可见**元素 → 只留
-落在**页面底部区域**（`bottom_region_ratio`，默认视口下 25%）的元素，多个候选取
-最靠近底部的那个。一个候选都过滤不出来时（比如帧号栏做了虚拟滚动），自动 fallback
-到坐标点击（`timeline_start_x`/`timeline_y`/`frame_step_px`），记一条 warning，不会中断。
+### 2.1 软件要求
+
+- Python 3.10-3.12，推荐 Python 3.12
+- Microsoft Edge 或 Google Chrome
+- Qwen Model Studio API Key
+- 与当前 Scene 匹配的 Calibration YAML
+- Windows 10/11，或带桌面环境的 Ubuntu
+
+依赖由 `requirements.txt` 统一管理，包括 Playwright、PyYAML、NumPy、scikit-learn、Pillow、
+OpenAI SDK 和 python-dotenv。
+
+### 2.2 获取项目
+
+```bash
+git clone https://github.com/hhanting1-ux/QP-copilot.git
+cd QP-copilot
+```
+
+也可以下载 ZIP。后续命令都在能看到 `config.yaml`、`ui_app.py` 和
+`requirements.txt` 的项目根目录执行。
+
+---
+
+## 3. Vision API 配置
+
+### 3.1 API Key、Workspace 和地域
+
+在 Alibaba Cloud Model Studio 中确认：
+
+- API Key
+- Workspace ID
+- Workspace 地域
+- 可用模型，例如 `qwen3-vl-plus`
+
+API Key 和 API Base 必须属于兼容的 Workspace/地域。地域不一致可能返回 HTTP 401，即使 Key
+格式正确。
+
+OpenAI-compatible API Base 通常为：
+
+```text
+https://<workspace-id>.<region>.maas.aliyuncs.com/compatible-mode/v1
+```
+
+北京地域示例：
+
+```text
+https://<workspace-id>.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+```
+
+在 `config.yaml` 填写实际配置：
+
+```yaml
+ai_vision:
+  enabled: true
+  provider: "qwen"
+  model_name: "qwen3-vl-plus"
+  api_base: "https://<workspace-id>.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+  api_key_env: "DASHSCOPE_API_KEY"
+```
+
+### 3.2 创建 .env
+
+API Key 只保存在项目根目录 `.env`，不要写入代码或 `config.yaml`。
+
+Windows PowerShell：
+
+```powershell
+Copy-Item .env.example .env
+notepad .env
+```
+
+Ubuntu：
+
+```bash
+cp .env.example .env
+nano .env
+```
+
+内容：
+
+```dotenv
+DASHSCOPE_API_KEY=你的实际API_KEY
+```
+
+`.env` 已被 `.gitignore` 忽略，程序自动读取。
+
+### 3.3 验证 API
+
+该命令会发送一张 64x64 临时灰色图片，产生一次最小 API 调用。
+
+Windows：
+
+```powershell
+.\.venv\Scripts\python.exe check_qwen_connection.py
+```
+
+Ubuntu：
+
+```bash
+.venv/bin/python check_qwen_connection.py
+```
+
+成功输出：
+
+```text
+status=verified
+model=qwen3-vl-plus
+api_base=...
+Qwen-VL connection verified.
+```
+
+错误处理：
+
+- `Invalid API-key`：Key 错误，或 Key 与 API Base 的 Workspace/地域不匹配。
+- `Unknown scheme for proxy URL socks://...`：保持
+  `ai_vision.use_environment_proxy: false`，除非代理兼容 HTTPX。
+- `.env 不存在`：确认文件名是 `.env`，不是 `.env.txt`。
+- `missing_api_key`：确认变量名与 `api_key_env` 相同。
+
+---
+
+## 4. Windows 安装与启动
+
+### 4.1 首次创建环境
+
+打开 PowerShell 并进入项目目录：
+
+```powershell
+cd C:\path\to\QP-copilot
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m playwright install chromium
+```
+
+Windows 官方 Python 通常包含 Tkinter。若 `import tkinter` 失败，重新运行 Python 安装器并启用
+Tcl/Tk。然后按第 3 节创建 `.env` 并验证 Qwen。
+
+### 4.2 Edge Remote Debugging
+
+先完全关闭所有 Edge 窗口，再在 PowerShell 执行。常见 32 位安装目录：
+
+```powershell
+& "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe" `
+  --remote-debugging-port=9222 `
+  --user-data-dir="$env:USERPROFILE\edge-qp-debug"
+```
+
+64 位安装目录：
+
+```powershell
+& "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe" `
+  --remote-debugging-port=9222 `
+  --user-data-dir="$env:USERPROFILE\edge-qp-debug"
+```
+
+独立 `user-data-dir` 会保存 QP 登录状态。首次启动需要登录一次。
+
+浏览器启动后：
+
+1. 登录 QP。
+2. 打开需要质检的 Scene。
+3. **关闭所有其他标签页，只保留当前 QP 质检 Scene 页面。**
+4. 运行期间不要再打开新标签页。
+
+这是当前版本的强制使用条件。脚本通过 Remote Debugging 连接整个 Edge Context；存在其他页面时
+可能选择第一个标签页并把普通网页误判为质检页。即使配置了 `browser.page_title_hint`，匹配失败后
+仍会回退到第一个标签页，因此不能用它替代“只保留质检页面”。
+
+### 4.3 桌面 UI
+
+双击项目根目录的：
+
+```text
+Start_QP_Copilot.vbs
+```
+
+启动器自动使用 `.venv\Scripts\pythonw.exe`，不会打开额外 Terminal，不需要手动 activate。
+虚拟环境不存在或依赖不完整时，UI 会显示初始化命令并停止。
+
+---
+
+## 5. Ubuntu 安装与桌面 UI
+
+### 5.1 首次创建环境
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-pip python3-venv python3-tk git zenity
+
+cd /path/to/QP-copilot
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m playwright install chromium
+```
+
+然后按第 3 节创建 `.env` 并验证 Qwen。
+
+### 5.2 安装桌面图标
+
+只需执行一次：
+
+```bash
+chmod +x start_qp_copilot.sh install_ubuntu_launcher.sh
+./install_ubuntu_launcher.sh
+```
+
+安装脚本按当前项目绝对路径生成：
+
+- 桌面 `QP Copilot.desktop`
+- 应用菜单 `~/.local/share/applications/qp-copilot.desktop`
+
+启动器使用 `Terminal=false`。不要直接双击 `start_qp_copilot.sh`，它是桌面入口调用的底层脚本。
+如果移动项目目录，需要在新目录重新运行安装脚本。部分桌面环境首次使用时还需要右键图标并选择
+**Allow Launching**。
+
+### 5.3 Edge Remote Debugging
+
+
+```bash
+microsoft-edge-stable \
+  --remote-debugging-port=9222 \
+  --user-data-dir="$HOME/edge-qp-debug"
+```
+
+这就是当前项目实际验证使用的 Ubuntu 启动命令。Edge 启动后登录 QP、打开
+目标 Scene，然后**关闭所有其他标签页，只保留当前质检 Scene 页面**。运行期间也不要打开新标签页，
+否则脚本可能连接错误页面。
+
+### 5.4 日常启动
+
+双击桌面 **QP Copilot**，或从应用菜单打开。不需要：
+
+```bash
+source .venv/bin/activate
+python main.py
+```
+
+---
+
+## 6. 使用桌面 UI
+
+必填项：
+
+- **Scene Number**：QP Scene ID。
+- **Frame Count**：Scene 总帧数，例如 81。
+- **Calibration YAML**：完整 YAML 文本。
+
+任何一项为空会立即报错。Calibration 无法解析或没有 Camera 时也会在启动前报错。
+
+操作顺序：
+
+1. 确认 Edge 已用调试端口启动并打开正确 Scene。
+2. 输入 Scene Number 和 Frame Count。
+3. 粘贴与当前 PCD/JPG 匹配的 Calibration YAML。
+4. 点击 **Start Inspection**。
+5. 等待 `[9/9] Inspection Finished`。
+6. 点击两个报告旁的 **Open**。
+
+按钮行为：
+
+- **Open Report Folder**：打开 `outputs/reports/`。
+- **Reset**：只清空 UI 状态，不删除报告/Assets，不关闭 Edge。
+- **Delete Scene Files**：输入 Scene Number，再输入 `DELETE`，清理该 Scene 本地数据。
+
+### 首帧策略
+
+```yaml
+scene:
+  start_frame_index: 1
+  skip_first_frame: true
+```
+
+程序连接后才安装 Network Listener，当前首帧资源通常已经加载完，等待它会产生假超时。因此：
+
+- Scene 总帧数仍按 UI 输入记录。
+- Frame 1 不导航、不等待、不截图、不提取 BBox、不下载 Assets。
+- Frame 1 不记 MissingBBox 或 EmptyFrame。
+- 从 Frame 2 开始质检。
+
+81 帧 Scene 检查 Frame 2-81，共 80 帧，UI 显示 `1/80` 到 `80/80`。
+
+---
+
+## 7. Calibration 要求
+
+从任务检索中找到当前 Scene ID（32 位）对应的数据集，复制 Calibration 参数并粘贴到 UI 的
+**Calibration YAML** 输入框。
+
+UI 使用 `CalibrationLoader.loads()`。YAML 根节点必须是 Mapping，参数结构包含：
+
+```text
+hardware
+  sensors
+    camera_labels
+    cameras
+    lidars
+```
+
+Camera 可包含 `image_size`、`intrinsic`、`distort`、`distortion_type`、`extrinsic`、
+`default`、`location`、`device` 和 `type`。
+
+新增 Camera 只修改 YAML，不修改代码。Calibration 可以包含多于 5 个 Camera；Projection 只处理
+当前采样帧中存在对应 JPG 且投影可见的 Camera。
+
+本次输入归档到：
+
+```text
+assets/scene_<scene_id>/calibration_used.yaml
+```
+
+---
+
+## 8. 浏览器、切帧与等待
+
+### 8.1 切帧
+
+`navigator.py` 依次执行：
+
+1. 帧号文本精确匹配。
+2. 只保留可见元素。
+3. 只保留页面底部候选。
+4. 多候选取最靠近底部者。
+5. 找不到时坐标 fallback。
 
 ```yaml
 navigation:
-  mode: "visible_text_bottom"
-  bottom_region_ratio: 0.75   # 帧号栏靠页面上方的话调小，比如 0.5
-  fallback_mode: "coordinates"
-  timeline_start_x: 200        # fallback 用：第 1 帧的 x 坐标（F12 里悬停量出来）
+  bottom_region_ratio: 0.75
+  timeline_start_x: 200
   timeline_y: 780
-  frame_step_px: 12            # 每往后一帧 x 增加多少像素
+  frame_step_px: 12
 ```
 
-终端每次切帧会打印一行诊断日志（`文本候选`/`可见`/`底部候选`/`fallback`），
-`底部候选=0` 多的话就是 `bottom_region_ratio` 需要调整。
+### 8.2 页面就绪
+
+`frame_ready.py` 等待期望 PCD/JPG、网络安静期和额外渲染时间。超时只记 Warning，不停止 Scene。
 
 ---
 
-## 4. BBox 数据与质检规则引擎
+## 9. Assets、Cluster、Projection 与 Vision
 
-BBox 数据在 `window.viewer` 的 Three.js 场景图里，类型是 `BoxVolume` 的节点上
-（`bbox_extractor.py` 递归查找 `constructor.name === 'BoxVolume'`，不认定固定属性名，
-因为 `recycleVolumes`/`annotationGroup` 实测不总是指向当前渲染的框）。`position`/
-`rotation`/`scale`/`trackId`/`className` 都确认能读到真实值，跟画面上的标注框对得上。
+### 9.1 Assets
 
-`bbox_data.csv` 主要字段：`scene_id, frame_index, bbox_index, track_id, target_id,
-uuid, object_id, label, className, position_x/y/z, rotation_x/y/z, scale_x/y/z,
-visible, resolved_target_field, resolved_target_key`。`target_id`/`object_id`/`label`
-在当前平台上没有对应数据，列会保留、值留空。
-
-**跨帧目标标识**：按 `track_id > target_id > uuid > object_id > bbox_index` 优先级，
-`bbox_extractor.py` 已经算好写进 `resolved_target_field`/`resolved_target_key` 两列，
-规则引擎和以后新增的规则都直接用这两列，不用重新判断优先级。
-
-### 当前已实现的规则
-
-全部在 `config.yaml -> rule_engine.enabled_rules` 里，跨帧比较用的就是上面的
-`resolved_target_key`：
-
-| rule_id | 说明 | 阈值参数 |
-|---|---|---|
-| `LabelConsistency` | 同一目标跨帧 className 不能变 | 无 |
-| `PositionJump` | 同一目标相邻帧位置距离变化超过阈值 | `position_jump_threshold`（默认 25 米） |
-| `RotationJump` | 同一目标相邻帧 `rotation_z` 变化超过阈值（已处理角度环绕） | `rotation_jump_threshold`（默认 1 弧度） |
-| `SizeConsistency` | 同一目标相邻帧 `scale_x/y/z` 任一轴变化比例超过阈值 | `size_change_threshold`（默认 30%） |
-| `BrokenTrack` | 同一目标连续消失 ≤ N 帧后又出现（消失区间跟"整帧 0 个框"重叠时不报，避免帧级问题被当成每个目标的追踪问题重复报） | `broken_track_gap`（默认 3 帧） |
-| `EmptyFrame` | 某帧一个框都没有 | 无 |
-| `SizeOutlier` | 框任一尺寸小于/大于合理范围 | `size_outlier_min`（0.1 米）/ `size_outlier_max`（30 米） |
-| `StaticObjectPosition` | 静止目标（灯塔/岸桥/场桥/雪糕筒等，见 `static_object_classes`）相邻帧位置变化超过阈值 | `static_object_position_threshold`（默认 0.5 米） |
-
-`PositionJump`/`RotationJump`/`SizeConsistency`/`StaticObjectPosition` 都要求
-`frame_index` 正好相邻（差 1）才比较——跳过的帧不计入，避免几帧累积的正常位移被
-误判成"一帧内的跳变"。同一目标同一种问题如果连续帧持续命中，只保留第一次发现的
-记录，`rule_report.csv` 里的 `first_frame`/`last_frame`/`occurrence_count` 三列
-记录持续到哪一帧、共命中几次。
-
-### 新增一条规则
-
-在 `rule_engine.py` 里写一个函数、注册到 `RULE_REGISTRY`，再把名字加进
-`config.yaml -> rule_engine.enabled_rules`，不需要改这个文件之外的任何模块：
-
-```python
-def my_rule(ctx: RuleContext) -> list[RuleFinding]:
-    findings = []
-    for frame_index, boxes in ctx.frames.items():
-        for b in boxes:
-            if float(b["scale_x"] or 0) > 20:
-                findings.append(RuleFinding(
-                    scene_id=ctx.scene_id, frame_index=frame_index,
-                    track_id=b["resolved_target_key"], bbox_index=b["bbox_index"],
-                    label=b["className"], rule_id="box_too_long", severity="Warning",
-                    message=f"scale_x={b['scale_x']} 超过阈值",
-                ))
-    return findings
-
-RULE_REGISTRY["box_too_long"] = my_rule
+```yaml
+assets:
+  enabled: true
+  sample_interval: 10
+  download_pcd: true
+  download_jpg: true
 ```
 
-`ctx.tracks[key]` 是已经按 `frame_index` 排好序的 `(frame_index, box_dict)` 列表，
-跨帧类规则参考 `rule_position_jump` 的写法。
+`sample_interval` 只影响 PCD/JPG、Cluster、Projection 和 Vision 的资产帧数量，不影响 Frame 2
+起的逐帧 BBox 和普通规则。
 
-### 只重跑规则，不重新采集
+默认采样锚点是 Frame 2。81 帧、interval=10：
 
-`bbox_data.csv` 采好之后，调规则不需要重新打开浏览器：
+```text
+2, 12, 22, 32, 42, 52, 62, 72
+```
+
+### 9.2 Residual Cluster
+
+```text
+读取 binary / binary_compressed PCD
+-> 删除已有 Oriented BBox 内点
+-> 自车区域过滤
+-> 100m 水平范围过滤
+-> Voxel Downsample
+-> Height Filter
+-> 点级 HDBSCAN（可配置 DBSCAN）
+-> Cluster Fragment AABB / Z 二级合并
+-> 重新计算 point count、center、AABB、volume
+-> PCA linearity / planarity / flatness
+-> 几何质量过滤
+-> Residual Cluster Candidate
+```
+
+第二级合并用于组合同一物体被点级聚类拆开的碎片，不负责类别识别。
+
+### 9.3 Projection 与 AI 图片
+
+`projection_pipeline.py` 消费现有 Cluster/BBox 和 Calibration。每个可见 Candidate 生成：
+
+- `context.jpg`：全场景，只画当前 Candidate。
+- `crop.jpg`：局部无框图片。
+- `manifest.json`：3D 几何、ROI、Camera、visible_points 和路径。
+
+原始 JPG 不覆盖。Projection 低质量 Candidate 不调用 Qwen。
+
+### 9.4 Vision
+
+漏标：
+
+```text
+Residual Cluster -> Projection -> AI Input -> Qwen -> PossibleMissingAnnotation
+```
+
+错标：
+
+```text
+Existing BBox -> Projection -> AI Input -> Qwen
+-> VisionLabelMismatch / VisionBBoxMismatch
+```
+
+两种 Candidate 共用 Projection、AI Input、Verifier 和 Report。当前优化：
+
+- 每次只判断一个 Candidate。
+- 同一 BBox Track 只选择投影质量最佳的一帧。
+- 漏标先用已有 Track 估计自车运动，再按至少 3 次稳定观测去重。
+- 两路 API 并发并复用 HTTP Client。
+- 成功结果按内容 SHA256 缓存到 `ai_inputs/scene_<scene_id>/.vision_cache/`。
+- 类别必须位于 `config/vision_categories.yaml`。
+- 不确定、背景、噪声、超出类别或尺寸门控失败不写成最终漏标。
+
+---
+
+## 10. 质检规则
+
+最终报告统一合并三类结果：普通 Rule Engine 规则、Residual Cluster 漏标复核，以及 Existing BBox
+错标复核。`VisionLabelMismatch` 和 `VisionBBoxMismatch` 由 Vision Pipeline 生成，不属于普通
+`RULE_REGISTRY`，但使用相同的 `RuleFinding` 数据结构并写入同一份报告。
+
+| Rule ID | 职责 |
+|---|---|
+| `LabelConsistency` | 同一 Track 跨帧 Label 变化 |
+| `PositionJump` | 相邻帧位置跳变 |
+| `RotationJump` | 相邻帧 rotation_z 跳变 |
+| `SizeConsistency` | 同一 Track 尺寸比例变化 |
+| `BrokenTrack` | 短暂消失后重新出现 |
+| `EmptyFrame` | 成功读取但 BBox 数量为 0 |
+| `SizeOutlier` | 单轴尺寸超出全局范围 |
+| `DimensionMismatch` | 实测尺寸超出 Reference Size +/- Tolerance |
+| `PossibleMissingAnnotation` | Residual Cluster 疑似漏标；Vision 开启时由 Vision 生成最终结论 |
+| `VisionLabelMismatch` | Existing BBox 覆盖目标，但 Qwen 复核认为当前 Label 与图像内容明显不一致 |
+| `VisionBBoxMismatch` | Qwen 复核认为 Existing BBox 未正确覆盖所标目标，例如框偏离、框住背景或无对应目标 |
+| `MissingBBox` | 读取失败 |
+
+
+
+尺寸库位于 `config/vehicle_dimensions.yaml`，判断公式是
+`reference_size * (1 +/- tolerance)`。同一 Label 有多种真实尺寸时使用变体，
+`multi_variant_strategy: any_variant` 表示任一变体通过即不报警。
+
+---
+
+## 11. 输出目录
+
+### 最终报告
+
+```text
+outputs/reports/rule_report.csv
+outputs/reports/rule_summary.json
+```
+
+`rule_report.csv` 包含 Scene/Frame/Track/Cluster、3D center/size、Camera/ROI、类别、置信度、
+原因和图片路径。
+
+`rule_summary.json` 包含总帧/BBox/Rule 统计，以及漏标/错标 API 次数、缓存、重试、失败、
+平均耗时、墙钟时间和并发节省。
+
+### 中间文件
+
+```text
+outputs/
+  reports/
+    bbox_data.csv
+    capture_report.csv
+    network_assets.csv
+    mapping_report.txt
+    bbox_probe_report.json
+  screenshots/
+
+assets/
+  scene_<scene_id>/
+    calibration_used.yaml
+    metadata.json
+    frame_NNNN/
+      pointcloud.pcd
+      images/
+      projection_debug/
+
+ai_inputs/
+  scene_<scene_id>/
+    frame_NNNN/
+      cluster_xxx/
+      bbox_xxx/
+    .vision_cache/
+```
+
+固定报告会被下一次 Run 覆盖；Assets 和 AI Inputs 按 Scene/Frame/Candidate 保存。
+
+---
+
+## 12. Reset 与 Cleanup
+
+Reset 只恢复 UI，不删除文件、不关闭浏览器。
+
+Cleanup 删除目标 Scene 的：
+
+- `outputs/reports` 当前批次报告
+- `outputs/screenshots`
+- `assets/scene_<scene_id>`
+- `ai_inputs/scene_<scene_id>`
+- Vision Cache
+
+不会删除代码、配置、`.env`、虚拟环境或其他 Scene。
+
+命令行 dry-run：
+
+Windows：
+
+```powershell
+echo 29694 | .\.venv\Scripts\python.exe cleanup_scene.py --dry-run
+```
+
+Ubuntu：
 
 ```bash
-python rule_engine.py                                # 默认读 outputs/reports/bbox_data.csv
-python rule_engine.py outputs/reports/bbox_data.csv     # 也可以显式指定路径
+printf '29694\n' | .venv/bin/python cleanup_scene.py --dry-run
 ```
-
-### 单帧 BBox 读取失败不会中断
-
-某一帧因为平台原因（页面未加载完成、JS 报错、网络延迟等）读取 BBox 失败，`main.py`
-只记下这一帧继续处理下一帧，不重试不中断。`rule_report.csv` 会有一条
-`rule_id=MissingBBox, severity=Warning` 的记录，`rule_summary.json` 的
-`missing_bbox_frames` 会列出所有失败的帧号。`bbox_data.csv` 依然会生成（哪怕全部帧
-都失败，也是一份只有表头的文件）。只有文件写入本身失败（磁盘满/没权限）这种程序级
-异常才会让程序真正终止。
-
-### `bbox_probe_report.json`：调试用的广撒网探测
-
-`bbox_probe.py` 在确认 `bbox_extractor.py` 的精确提取位置之前，用来"探测数据大概在哪"——
-按关键词扫描 `window` 全局变量和 Three.js 场景，全程只读。现在位置已经确认，这份报告
-主要留作调试/以后平台改版时重新定位用，日常不需要看。
 
 ---
 
-## 5. 清理某个 scene 的本地数据
+## 13. 重要配置
+
+| 配置 | 作用 |
+|---|---|
+| `scene.skip_first_frame` | 跳过首帧，从 Frame 2 质检 |
+| `browser.cdp_url` | Remote Debugging 地址 |
+| `browser.page_title_hint` | 多标签页匹配 |
+| `frame_ready.timeout_seconds` | 单帧最大等待 |
+| `frame_ready.render_settle_ms` | 网络完成后的渲染等待 |
+| `assets.sample_interval` | PCD/JPG/Projection/Vision 采样 |
+| `rule_engine.*` | 普通规则和 Cluster 参数 |
+| `projection.*` | 可见点、Padding、Debug |
+| `ai_inputs.quality*.` | ROI 质量门 |
+| `ai_vision.api_base` | Qwen Workspace 地址 |
+| `ai_vision.model_name` | Vision 模型 |
+| `ai_vision.vision_workers` | API 并发，当前为 2 |
+| `ai_vision.cache` | 成功结果缓存 |
+| `ai_vision.*.confidence_threshold` | 报告准入置信度 |
+| `report.output_dir` | 报告目录 |
+
+详细阈值在 `config.yaml` 中有注释。正式 Run 前不要同时大幅调整多个阈值。
+
+---
+
+## 14. 项目结构
+
+```text
+QP-copilot/
+├── main.py                         # 9阶段 Pipeline
+├── ui_app.py / ui_app.pyw          # 桌面 UI / Windows 无控制台入口
+├── Start_QP_Copilot.vbs            # Windows 双击启动
+├── start_qp_copilot.sh             # Ubuntu UI 启动
+├── install_ubuntu_launcher.sh      # Ubuntu 桌面安装
+├── QP_Copilot.desktop.in           # 桌面入口模板
+├── runtime_env.py                  # .env 加载
+├── browser.py / navigator.py       # 浏览器会话与切帧
+├── network_recorder.py             # PCD/JPG 网络监听
+├── frame_ready.py / capture.py     # 就绪等待与截图
+├── report.py                       # capture_report.csv 数据结构
+├── analyzers.py / analyze.py       # 兼容的采集诊断分析层
+├── bbox_extractor.py / bbox_probe.py
+├── assets_downloader.py
+├── calibration.py
+├── cluster_detector.py             # HDBSCAN、二级合并、PCA
+├── cluster_projection.py
+├── projection_pipeline.py
+├── vision_candidate.py
+├── ai_input_builder.py
+├── temporal_cluster_dedup.py
+├── vision_verifier.py
+├── vision_quality_gate.py
+├── vision_cache.py
+├── vision_category_config.py       # Vision 类别白名单加载
+├── vision_classifier.py            # 保留的分类接口定义
+├── vision_pipeline.py
+├── rule_engine.py
+├── vehicle_dimension_config.py
+├── cleanup_scene.py
+├── check_qwen_connection.py
+├── config.yaml
+├── config/
+│   ├── vehicle_dimensions.yaml
+│   └── vision_categories.yaml
+├── .env.example
+└── requirements.txt
+```
+
+---
+
+## 15. 常见问题
+
+### Virtual Environment not found
+
+按 Windows 第 4.1 节或 Ubuntu 第 5.1 节创建根目录 `.venv`。不需要 activate。
+
+### 无法连接 127.0.0.1:9222
+
+- 完全关闭普通 Edge 后用调试参数重启。
+- 确认端口与 `browser.cdp_url` 一致。
+- 确认没有进程占用相同 user-data-dir。
+- 在浏览器访问 `http://127.0.0.1:9222/json/version`。
+
+### 连接错误标签页
+
+关闭 Edge 中所有其他标签页，只保留当前 QP 质检 Scene 页面，然后重新运行。不要依赖
+`browser.page_title_hint` 兜底，因为匹配失败仍会选择第一个标签页。
+
+### Frame 2 切帧失败
+
+检查 `bottom_region_ratio` 和 fallback 坐标。运行中不要改变浏览器缩放或窗口布局。
+
+### PCD/JPG 超时
+
+调大 `frame_ready.timeout_seconds` 或 `render_settle_ms`。单帧超时不会中断。
+
+### Projection 无输出
+
+确认采样帧有 PCD、JPG、成功读取的 BBox、匹配的 Calibration 和有效 Camera 外参。低质量投影不调用
+Vision。
+
+### Vision 很慢
+
+查看 `rule_summary.json -> vision_test_stats` 中的请求数、缓存命中、平均 API 秒数、请求墙钟时间
+和并发节省。遇到 429 时把 `vision_workers` 降为 1。
+
+### 报告仍是上一 Scene
+
+新 Run 完成前固定报告仍是旧结果。等待 `[9/9] Inspection Finished`，或运行前 Cleanup。运行中
+不要 Cleanup。
+
+---
+
+## 16. 安全与提交
+
+`.gitignore` 排除：
+
+- `.env`
+- `.venv/`
+- `__pycache__/` 和 `*.pyc`
+- `outputs/` 运行结果
+- `assets/` PCD/JPG
+- `ai_inputs/` 图片、Manifest、Cache
+- `*.log`
+
+提交前：
 
 ```bash
-python cleanup_scene.py              # 交互式：列出要删的文件，输入 DELETE 二次确认才真删
-python cleanup_scene.py --dry-run     # 只看会删哪些文件，不会真的删
+git status --short
+git diff --check
 ```
 
-（UI 里 **Cleanup Scene** 区域是同一个脚本的图形化入口）
-
-输入 scene_id 后，会在 `outputs/reports`、`outputs/screenshots` 两个目录里找**文件名或
-内容包含这个 scene_id** 的文件（截图靠文件名，固定名字的报告文件靠内容里的 `scene_id`
-字段；`mapping_report.txt` 内容不带 scene_id，如果同目录下已经有别的文件匹配上了，会一并
-纳入清理）。同时会删除根级 `assets/scene_<scene_id>/` 下的 PCD/JPG/debug 文件，并在文件
-删除后清掉空目录。列出清单后，输入 `DELETE`（一字不差）才会真正删除。
-
-安全边界：只在上述输出目录和精确匹配的 `assets/scene_<scene_id>/` 里处理，不会碰项目代码；
-`.gitkeep` 不参与匹配；`scene_id` 留空直接退出，不做任何事。
+不要提交真实 API Key、Cookie、PCD/JPG、客户 Calibration 或 Scene 报告。
 
 ---
 
-## 6. 常见问题
+## 17. 最终 Run 检查表
 
-- **截图空白 / 点云没渲染**：调大 `frame_ready.render_settle_ms`（网络加载完成不等于
-  3D 渲染完成，实测过 BBox 渲染经常滞后网络确认 1~3 帧的时间，这是固定延迟，不保证
-  100% 覆盖所有滞后情况）。
-- **某几帧总是等到超时**：调大 `frame_ready.timeout_seconds` 或 `frame_ready.quiet_ms`。
-- **`network_assets.csv` 里 pcd_count/jpg_count 都是 0**：默认 `network.grouping_mode:
-  "timestamp"` 按 URL 里资源自带的时间戳分组，不依赖清空缓冲区的时机；如果平台 URL
-  提取不出时间戳，改成 `"window"` 退回老式做法。
-- **想在同一批截图上重新跑 AI/规则分析**（不用重新打开浏览器）：
-  `python analyze.py`（读 `capture_report.csv`，走的是 `analyzers.py` 里的旧版可插拔
-  框架，第一版为空；BBox 相关质检走的是 `rule_engine.py`，见第 4 节）。
-
----
-
-## 7. 安全边界
-
-**全程不会**：自动点击"合格/驳回/提交"等修改平台评审状态的按钮；修改、删除、覆盖 QP
-平台上的任何数据；读取、保存、上传账号密码（登录全程手动完成）。
-
-**只会**：切帧（模拟按键/点击帧号/点击坐标）；被动监听网络请求（不拦截不修改不重放）；
-截图到本地 `outputs/`；在浏览器 Console context 里执行只读 JS；生成本地 CSV/JSON 报告。
-
----
-
-## 8. 目录结构
-
-```
-qp_copilot/
-├── ui_app.py / ui_app.pyw   # 桌面 UI（推荐入口），子进程调用 main.py / cleanup_scene.py
-├── main.py                    # 主流程入口：切帧 + 就绪等待 + 截图 + 网络记录 + BBox 提取 + Assets 下载 + Rule Engine
-├── rule_engine.py                # 质检规则引擎：读 bbox_data.csv / assets/ 运行规则，生成 rule_report.csv / rule_summary.json
-├── cleanup_scene.py                 # 按 scene_id 清理 outputs/ 和根级 assets/ 下的本地文件
-├── analyze.py                          # 旧版分析入口：读 capture_report.csv，见第 6 节
-├── browser.py / navigator.py / frame_ready.py / capture.py / network_recorder.py / assets_downloader.py
-│                                          # 浏览器连接、切帧、就绪判断、截图、网络记录、Assets 下载
-├── bbox_probe.py / bbox_extractor.py         # BBox 广撒网探测 / 针对性提取
-├── cluster_detector.py                            # 漏标候选检测：PCD 残余点云两级聚类
-├── vehicle_dimension_config.py                     # 尺寸参考库读取与 Reference Size + Tolerance 判断
-├── config/vehicle_dimensions.yaml                  # 车辆/设施/人员等类别的尺寸参考库
-├── vision_classifier.py                            # 视觉分类接口占位，当前不调用模型
-├── report.py / analyzers.py                     # capture_report.csv 读写 + 旧版分析框架
-├── test_assets_downloader.py / test_cluster_detector.py
-│                                          # Assets 采样逻辑和 Cluster Pipeline 的独立测试
-├── config.yaml                                     # 所有可调参数
-├── requirements.txt / README.md
-├── assets/                         # PCD/JPG 文件本体：assets/scene_<scene_id>/frame_NNNN/
-└── outputs/
-    ├── screenshots/    # 每帧截图
-    └── reports/         # 见第 2 节「输出文件一览」
-```
-
----
-
-## 9. 当前错标 / 漏标能力边界
-
-当前项目已经接入两类 Phase 2 几何规则，但仍然不是完整 AI 质检系统：
-
-- **错标 / 尺寸异常：`DimensionMismatch`**
-  - 数据库：`config/vehicle_dimensions.yaml`
-  - 读取接口：`vehicle_dimension_config.py`
-  - 判断方式：`reference_size × (1 ± tolerance)`，不是手写固定 min/max。
-  - Rule Engine 使用 `scale_x/y/z -> length/width/height`，按 className 查尺寸库。
-  - 对一个 className 有多个变体的类别（例如托架/平板车/自身拖挂车），默认
-    `multi_variant_strategy: any_variant`：落在任一变体容差范围内即认为尺寸可接受。
-  - 缺少参考尺寸、`no_fixed_value`、未知类别会跳过，不编造判断。
-
-- **漏标候选：`PossibleMissingAnnotation`**
-  - 读取 `assets_downloader.py` 已下载的本地 PCD：
-    `assets/scene_<scene_id>/frame_NNNN/pointcloud.pcd`
-  - 只覆盖已经下载 PCD 的帧，所以受 `assets.sample_interval` 影响；BBox 采集和其它规则仍跑完整帧。
-  - 流程：PCD -> 删除已有 BBox 内点 -> Voxel Downsample -> Height Filter ->
-    第一次点级 DBSCAN -> 第二次 Cluster-level Merge -> 重新计算几何/PCA 形状特征 ->
-    几何过滤 -> 写入统一 `rule_report.csv`。
-  - Cluster 只输出可疑残余点云候选，不识别类别，不调用 Vision/LLM。
-
-这些能力已经进入 `rule_engine.enabled_rules`，结果统一写入 `rule_report.csv` /
-`rule_summary.json`。但整体项目仍未完成 AI 视觉分类、截图裁剪、多模态复核等后续能力。
-
----
-
-## 10. Assets / Cluster / 尺寸库现状
-
-**Assets 下载已经是当前主流程的一部分，但只服务于本地质检，不修改 QP 平台数据。**
-
-- **`assets_downloader.py`**：Assets（PCD + JPG 文件本体）下载器。复用 `network_recorder.py`
-  已经监听、按帧分组好的 URL（不新增浏览器监听），通过当前已登录的浏览器 context 下载文件。
-  受 `config.yaml` 里的 `assets` 配置块控制：
-  - `assets.enabled`：总开关，关掉完全不影响现有任何功能。
-  - `assets.sample_interval`：每隔多少帧下载一次 PCD/JPG 文件本体（只影响 Assets 下载数量，
-    不影响 BBox 采集/Rule Engine/Report——那几个仍然跑完整 `frame_count`）。例如 81 帧、
-    `sample_interval=10` 只下载第 1/11/21/.../81 帧。
-  - 保存目录是项目根下独立的 `assets/`（跟 `outputs/` 平级），结构：
-    ```
-    assets/
-      scene_<scene_id>/
-        metadata.json          # 每帧下载结果：pcd_success / image_count / download_time / errors
-        frame_0001/
-          pointcloud.pcd
-          images/
-            camera_xxx.jpg
-    ```
-- **`test_assets_downloader.py`**：`sample_interval` 选帧逻辑的独立测试，`python
-  test_assets_downloader.py` 直接跑，不需要额外安装测试框架。
-- **`config/vehicle_dimensions.yaml` + `vehicle_dimension_config.py`**：车辆/物体尺寸参考库
-  已经接入 `DimensionMismatch`，提供 `load()` / `get_dimension()` / `check_dimension()` 接口。
-- **`cluster_detector.py`**：已经实现 PCD 读取、BBox 内点删除、预处理、两级聚类、PCA 形状过滤，
-  并通过 `PossibleMissingAnnotation` 写入现有 Rule Report。
-- **`vision_classifier.py`**：仍是接口占位，当前不调用任何模型/API。
-- **`cleanup_scene.py`**：现在会同时扫描 `outputs/reports`、`outputs/screenshots`，
-  并删除根级 `assets/scene_<scene_id>/` 下的文件和空目录。
+- [ ] `.venv` 已创建，依赖完整
+- [ ] `.env` 已填写 `DASHSCOPE_API_KEY`
+- [ ] API 检查返回 `status=verified`
+- [ ] API Base 与 Key 的 Workspace/地域一致
+- [ ] Edge 已用 Remote Debugging 启动
+- [ ] QP 已登录，正确 Scene 质检页面已打开
+- [ ] Edge 中其他标签页已全部关闭，只保留当前质检 Scene 页面
+- [ ] Scene Number、Frame Count 正确
+- [ ] Calibration YAML 与当前 PCD/JPG 匹配
+- [ ] 运行中不移动窗口、不改变缩放、不关闭质检页
+- [ ] 完成后核对两个最终报告的 Scene ID

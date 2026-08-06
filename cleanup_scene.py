@@ -59,10 +59,19 @@ DEFAULT_SCAN_DIRS = ["outputs/reports", "outputs/screenshots"]
 # assets_downloader.py 的下载目录默认值，跟 config.yaml -> assets.output_dir 保持一致。
 # 这是顶层的 assets/，即 assets_downloader.py 实际保存 PCD/JPG 的目录。
 DEFAULT_ASSETS_DOWNLOAD_DIR = "assets"
+DEFAULT_AI_INPUTS_DIR = "ai_inputs"
 
 # 内容里不带 scene_id、没法直接按文件名/内容匹配的报告文件——如果它所在目录已经有
 # 别的文件因为这个 scene_id 匹配上了，就一并纳入清理（见模块开头「匹配规则」的说明）。
-SCENE_AGNOSTIC_COMPANION_FILES = {"mapping_report.txt"}
+SCENE_AGNOSTIC_COMPANION_FILES = {
+    "bbox_data.csv",
+    "bbox_probe_report.json",
+    "capture_report.csv",
+    "mapping_report.txt",
+    "network_assets.csv",
+    "rule_report.csv",
+    "rule_summary.json",
+}
 
 
 def _load_scan_dirs(config_path: str = "config.yaml") -> list[str]:
@@ -96,7 +105,20 @@ def _load_assets_download_dir(config_path: str = "config.yaml") -> str:
     return config.get("assets", {}).get("output_dir") or DEFAULT_ASSETS_DOWNLOAD_DIR
 
 
-def find_asset_scene_files(scene_id: str, assets_download_dir: str) -> list[tuple[Path, str]]:
+def _load_ai_inputs_dir(config_path: str = "config.yaml") -> str:
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError):
+        return DEFAULT_AI_INPUTS_DIR
+    return config.get("ai_inputs", {}).get("output_dir") or DEFAULT_AI_INPUTS_DIR
+
+
+def find_asset_scene_files(
+    scene_id: str,
+    assets_download_dir: str,
+    label: str = "Assets",
+) -> list[tuple[Path, str]]:
     """在 assets/ 下按 scene_<scene_id> 目录名匹配，而不是按文件名/内容——
     assets_downloader.py 产出的 pointcloud.pcd / camera_xxx.jpg 文件名本身不带 scene_id，
     scene_id 只体现在父目录名（scene_<scene_id>）里。目录存在就把它下面递归找到的所有文件
@@ -108,7 +130,7 @@ def find_asset_scene_files(scene_id: str, assets_download_dir: str) -> list[tupl
 
     for path in sorted(scene_dir.rglob("*")):
         if path.is_file() and path.name != ".gitkeep":
-            matches.append((path, "Assets 场景目录匹配"))
+            matches.append((path, f"{label} 场景目录匹配"))
 
     return matches
 
@@ -231,20 +253,27 @@ def main() -> None:
     matches += find_asset_scene_files(scene_id, assets_download_dir)
     asset_dirs = find_asset_scene_dirs(scene_id, assets_download_dir)
 
+    ai_inputs_dir = _load_ai_inputs_dir()
+    matches += find_asset_scene_files(scene_id, ai_inputs_dir, label="AI Inputs")
+    ai_input_dirs = find_asset_scene_dirs(scene_id, ai_inputs_dir)
+
     print()
-    if not matches and not asset_dirs:
+    if not matches and not asset_dirs and not ai_input_dirs:
         print(f"[信息] 没有找到跟 scene_id={scene_id!r} 相关的文件或 Assets 目录。")
         return
 
-    print(f"将删除（scene_id={scene_id!r}，共 {len(matches)} 个文件，{len(asset_dirs)} 个 Assets 目录）：")
+    total_scene_dirs = len(asset_dirs) + len(ai_input_dirs)
+    print(f"将删除（scene_id={scene_id!r}，共 {len(matches)} 个文件，{total_scene_dirs} 个场景目录）：")
     for path, reason in matches:
         print(f"  {path.as_posix()}（{reason}）")
     for path in asset_dirs:
         print(f"  {path.as_posix()}/（空目录清理）")
+    for path in ai_input_dirs:
+        print(f"  {path.as_posix()}/（AI Inputs 空目录清理）")
 
     if dry_run:
         print()
-        print(f"[信息] dry-run 模式，以上 {len(matches)} 个文件和 {len(asset_dirs)} 个目录不会被真正删除。")
+        print(f"[信息] dry-run 模式，以上 {len(matches)} 个文件和 {total_scene_dirs} 个目录不会被真正删除。")
         return
 
     print()
@@ -255,6 +284,7 @@ def main() -> None:
 
     deleted = delete_files(matches)
     removed_dirs = remove_empty_asset_scene_dirs(scene_id, assets_download_dir)
+    removed_dirs += remove_empty_asset_scene_dirs(scene_id, ai_inputs_dir)
     print()
     print(f"[信息] 已删除 {deleted} / {len(matches)} 个文件，清理空 Assets 目录 {removed_dirs} 个。")
 

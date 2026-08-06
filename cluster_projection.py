@@ -11,12 +11,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from calibration import CalibrationManager, CameraCalibration
-from cluster_detector import ClusterCandidate
+from cluster_detector import ClusterCandidate, OrientedBox
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,11 @@ class ProjectedROI:
     clipped: bool
     calibration_image_size: tuple[int, int] | None = None
     target_image_size: tuple[int, int] | None = None
+
+    @property
+    def candidate_id(self) -> str:
+        """Generic name; cluster_id remains for report/debug compatibility."""
+        return self.cluster_id
 
 
 @dataclass(frozen=True)
@@ -86,22 +92,47 @@ def project_cluster_to_camera(
     camera: CameraCalibration,
     image_path: str | Path | None = None,
     min_depth: float = 0.1,
+    min_visible_points: int = 3,
+    padding_px: int = 8,
 ) -> ProjectedROI | None:
-    """Project one cluster AABB hint to one camera and return a clipped ROI.
+    """Project one cluster's actual points and return a clipped image ROI.
 
     The observed calibration stores camera.extrinsic as camera-to-lidar/world,
     so projection uses its inverse as the lidar/world-to-camera transform. The
     camera intrinsic is then applied as the 3x3 pinhole matrix. Distortion is
-    preserved in calibration data but intentionally not applied here; this stage creates the Projection
-    infrastructure and debug ROI, not final pixel-perfect geometry.
+    preserved in calibration data but intentionally not applied because the
+    downloaded QP JPGs are already rectified.
     """
+    projection_points = _cluster_projection_points(cluster)
+    return project_geometry_to_camera(
+        candidate_id=cluster.cluster_id,
+        points_xyz=projection_points,
+        camera=camera,
+        image_path=image_path,
+        min_depth=min_depth,
+        min_visible_points=min_visible_points,
+        padding_px=padding_px,
+    )
+
+
+def project_geometry_to_camera(
+    candidate_id: str,
+    points_xyz: np.ndarray,
+    camera: CameraCalibration,
+    image_path: str | Path | None = None,
+    min_depth: float = 0.1,
+    min_visible_points: int = 3,
+    padding_px: int = 8,
+) -> ProjectedROI | None:
+    """Project arbitrary 3D evidence with the existing camera math."""
     if camera.extrinsic is None or camera.intrinsic is None or camera.image_size is None:
         return None
-    if not cluster.bbox_hint:
+
+    projection_points = np.asarray(points_xyz, dtype=np.float64)
+    if projection_points.ndim != 2 or projection_points.shape[1] < 3 or projection_points.size == 0:
         return None
 
-    corners = _bbox_corners(cluster.bbox_hint)
-    pixels, visible_count = project_points(corners, camera, min_depth=min_depth)
+    pixels, _ = project_points(projection_points[:, :3], camera, min_depth=min_depth)
     if pixels.size == 0:
         return None
 
@@ -109,38 +140,99 @@ def project_cluster_to_camera(
     target_size = _target_image_size(image_path, calibration_size)
     pixels = _scale_pixels_to_target_image(pixels, calibration_size, target_size)
     width, height = target_size
-    x_min, y_min = pixels.min(axis=0)
-    x_max, y_max = pixels.max(axis=0)
-
-    if x_max < 0 or y_max < 0 or x_min >= width or y_min >= height:
+    inside = (
+        (pixels[:, 0] >= 0)
+        & (pixels[:, 0] < width)
+        & (pixels[:, 1] >= 0)
+        & (pixels[:, 1] < height)
+    )
+    visible_pixels = pixels[inside]
+    required_points = max(1, min_visible_points)
+    if len(visible_pixels) < required_points:
         return None
 
-    clipped_x1 = int(max(0, min(width - 1, np.floor(x_min))))
-    clipped_y1 = int(max(0, min(height - 1, np.floor(y_min))))
-    clipped_x2 = int(max(0, min(width - 1, np.ceil(x_max))))
-    clipped_y2 = int(max(0, min(height - 1, np.ceil(y_max))))
+    x_min, y_min = visible_pixels.min(axis=0)
+    x_max, y_max = visible_pixels.max(axis=0)
+    raw_x1 = int(np.floor(x_min)) - max(0, padding_px)
+    raw_y1 = int(np.floor(y_min)) - max(0, padding_px)
+    raw_x2 = int(np.ceil(x_max)) + max(0, padding_px)
+    raw_y2 = int(np.ceil(y_max)) + max(0, padding_px)
+
+    clipped_x1 = max(0, min(width - 1, raw_x1))
+    clipped_y1 = max(0, min(height - 1, raw_y1))
+    clipped_x2 = max(0, min(width - 1, raw_x2))
+    clipped_y2 = max(0, min(height - 1, raw_y2))
     if clipped_x2 <= clipped_x1 or clipped_y2 <= clipped_y1:
         return None
 
-    clipped = (
-        clipped_x1 != int(np.floor(x_min))
-        or clipped_y1 != int(np.floor(y_min))
-        or clipped_x2 != int(np.ceil(x_max))
-        or clipped_y2 != int(np.ceil(y_max))
-    )
+    clipped = (clipped_x1, clipped_y1, clipped_x2, clipped_y2) != (raw_x1, raw_y1, raw_x2, raw_y2)
 
     return ProjectedROI(
         camera_id=camera.camera_id,
         location=camera.location,
         image_path=str(image_path) if image_path is not None else None,
-        cluster_id=cluster.cluster_id,
+        cluster_id=str(candidate_id),
         roi=(clipped_x1, clipped_y1, clipped_x2, clipped_y2),
-        visible_points=visible_count,
-        total_points=len(corners),
+        visible_points=len(visible_pixels),
+        total_points=len(projection_points),
         clipped=clipped,
         calibration_image_size=calibration_size,
         target_image_size=target_size,
     )
+
+
+def project_oriented_boxes_to_asset_cameras(
+    candidates: Iterable[tuple[str, OrientedBox]],
+    manager: CalibrationManager,
+    images_dir: str | Path,
+    min_depth: float = 0.1,
+    min_visible_points: int = 3,
+    padding_px: int = 8,
+    edge_samples: int = 9,
+) -> dict[str, list[ProjectedROI]]:
+    """Project Existing BBoxes through the same camera projection implementation."""
+    matches = build_asset_camera_matches(manager, images_dir)
+    output: dict[str, list[ProjectedROI]] = {match.asset_name: [] for match in matches}
+    geometry = [
+        (candidate_id, oriented_box_edge_points(box, edge_samples=edge_samples))
+        for candidate_id, box in candidates
+    ]
+    for match in matches:
+        for candidate_id, points in geometry:
+            roi = project_geometry_to_camera(
+                candidate_id,
+                points,
+                match.camera,
+                match.image_path,
+                min_depth=min_depth,
+                min_visible_points=min_visible_points,
+                padding_px=padding_px,
+            )
+            if roi is not None:
+                output[match.asset_name].append(roi)
+    return output
+
+
+def oriented_box_edge_points(box: OrientedBox, edge_samples: int = 9) -> np.ndarray:
+    """Sample all cuboid edges in world coordinates using Three.js XYZ Euler order."""
+    half = np.asarray(box.size, dtype=np.float64) / 2.0
+    corners = np.array([
+        [sx * half[0], sy * half[1], sz * half[2]]
+        for sx in (-1.0, 1.0)
+        for sy in (-1.0, 1.0)
+        for sz in (-1.0, 1.0)
+    ], dtype=np.float64)
+    sample_count = max(2, int(edge_samples))
+    samples = []
+    for index, corner in enumerate(corners):
+        for axis in range(3):
+            neighbor = index ^ (1 << (2 - axis))
+            if index < neighbor:
+                weights = np.linspace(0.0, 1.0, sample_count)[:, None]
+                samples.append(corner + weights * (corners[neighbor] - corner))
+    local_points = np.vstack(samples)
+    rotation = _euler_xyz_to_matrix(*box.rotation_euler)
+    return local_points @ rotation.T + np.asarray(box.center, dtype=np.float64)
 
 
 def project_points(
@@ -176,13 +268,23 @@ def project_clusters_to_asset_cameras(
     clusters: list[ClusterCandidate],
     manager: CalibrationManager,
     images_dir: str | Path,
+    min_depth: float = 0.1,
+    min_visible_points: int = 3,
+    padding_px: int = 8,
 ) -> dict[str, list[ProjectedROI]]:
     """Project clusters to every camera that has a matching asset image."""
     matches = build_asset_camera_matches(manager, images_dir)
     output: dict[str, list[ProjectedROI]] = {match.asset_name: [] for match in matches}
     for match in matches:
         for cluster in clusters:
-            roi = project_cluster_to_camera(cluster, match.camera, match.image_path)
+            roi = project_cluster_to_camera(
+                cluster,
+                match.camera,
+                match.image_path,
+                min_depth=min_depth,
+                min_visible_points=min_visible_points,
+                padding_px=padding_px,
+            )
             if roi is not None:
                 output[match.asset_name].append(roi)
     return output
@@ -191,10 +293,14 @@ def project_clusters_to_asset_cameras(
 def save_projection_debug_images(
     projections_by_asset: dict[str, list[ProjectedROI]],
     output_dir: str | Path,
+    line_width: int = 1,
 ) -> list[str]:
     """Draw ROI boxes on asset images and save one debug JPG per visible camera."""
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
+    for stale_path in out.glob("projection_debug_*.jpg"):
+        stale_path.unlink()
+
     saved = []
     for asset_name, rois in projections_by_asset.items():
         visible_rois = [roi for roi in rois if roi.image_path]
@@ -207,9 +313,10 @@ def save_projection_debug_images(
         draw = ImageDraw.Draw(canvas)
         font = ImageFont.load_default()
 
+        draw_width = max(1, int(line_width))
         for index, roi in enumerate(visible_rois):
             color = _debug_color(index)
-            draw.rectangle(roi.roi, outline=color, width=4)
+            draw.rectangle(roi.roi, outline=color, width=draw_width)
             label = f"{roi.cluster_id} {roi.camera_id}"
             text_xy = (roi.roi[0] + 4, max(0, roi.roi[1] - 14))
             draw.text(text_xy, label, fill=color, font=font)
@@ -233,6 +340,27 @@ def _bbox_corners(bbox_hint: dict) -> np.ndarray:
         [maxs[0], maxs[1], mins[2]],
         [maxs[0], maxs[1], maxs[2]],
     ], dtype=np.float64)
+
+
+def _euler_xyz_to_matrix(rx: float, ry: float, rz: float) -> np.ndarray:
+    """Match the Three.js XYZ convention used by Cluster point removal."""
+    cx, sx = np.cos(rx), np.sin(rx)
+    cy, sy = np.cos(ry), np.sin(ry)
+    cz, sz = np.cos(rz), np.sin(rz)
+    rot_x = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]], dtype=np.float64)
+    rot_y = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]], dtype=np.float64)
+    rot_z = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]], dtype=np.float64)
+    return rot_x @ rot_y @ rot_z
+
+
+def _cluster_projection_points(cluster: ClusterCandidate) -> np.ndarray:
+    if cluster.points_xyz is not None:
+        points = np.asarray(cluster.points_xyz, dtype=np.float64)
+        if points.ndim == 2 and points.shape[1] >= 3:
+            return points[:, :3]
+    if cluster.bbox_hint:
+        return _bbox_corners(cluster.bbox_hint)
+    return np.empty((0, 3), dtype=np.float64)
 
 
 def _camera_match_sort_key(camera: CameraCalibration) -> tuple[int, int, str]:

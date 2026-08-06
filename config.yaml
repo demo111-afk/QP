@@ -15,6 +15,10 @@ scene:
   # 起始帧号。QP 平台底部帧号栏通常从 1 开始显示（1~81），
   # 所以默认是 1；如果平台从 0 开始显示，改成 0。
   start_frame_index: 1
+  # 当前页面的首帧资源通常在网络监听器启动前已经加载完，等待它只会超时。
+  # true 时首帧不导航、不等待、不截图、不提取 BBox、不下载 Assets，也不记为缺失或空帧；
+  # Scene 总帧数仍使用上面的 frame_count，实际质检从第二帧开始。
+  skip_first_frame: true
 
 # -------------------------------------------------------------
 # 浏览器连接方式
@@ -199,7 +203,6 @@ rule_engine:
     - BrokenTrack                    # 同一目标连续消失 <= N 帧后又出现（默认 Info，满足条件才升级 Warning）
     - EmptyFrame                         # 某帧一个框都没有
     - SizeOutlier                          # 框的任一尺寸小于/大于合理范围
-    - StaticObjectPosition                   # 静止目标（灯塔/塔桥/场桥/雪糕筒等）不应该移动
     - DimensionMismatch                        # 错标：BBox 尺寸跟 vehicle_dimensions.yaml 参考尺寸差太多（Phase 2）
     - PossibleMissingAnnotation                  # 漏标：PCD 里存在未被任何 BBox 覆盖的可疑点云聚类（Phase 2）
 
@@ -210,14 +213,6 @@ rule_engine:
   broken_track_gap: 3                    # 帧，BrokenTrack 用（消失超过这个数就不算 broken，算正常离场）
   size_outlier_min: 0.1                    # 米，SizeOutlier 下限
   size_outlier_max: 30.0                     # 米，SizeOutlier 上限
-  static_object_position_threshold: 0.5        # 米，StaticObjectPosition 用，所有类别统一用这一个阈值
-  static_object_classes:                         # 视为"静止不该动"的类别（className），按需增删
-    - "灯塔"
-    - "岸桥"
-    - "场桥"
-    - "场桥 轮胎吊 轨道吊"                            # 平台上这个类别的完整 className 是这个复合名，不是单独"场桥"两个字
-    - "雪糕筒"
-
   # ---- 以下是 Phase 2 新增两条规则的参数 ----
 
   # DimensionMismatch（错标）：只用 config/vehicle_dimensions.yaml 里的 Reference Size +
@@ -240,6 +235,14 @@ rule_engine:
   # 参数的点云预处理，目的仅仅是把 DBSCAN 的输入规模降到能跑得动。下面几个值都是按
   # 这次真实数据调出来的初始值，跟着实际效果继续调。
   cluster_detector:
+    ego_exclusion_box:                # 车体/传感器安装区域，删除每帧重复出现的固定近场回波。
+      enabled: true                   # 使用车体坐标轴范围，不使用整圈最小距离，避免误删近车真实目标。
+      min_x: -2.0
+      max_x: 2.8
+      min_y: -1.2
+      max_y: 1.2
+      min_z: -1.0
+      max_z: 2.5
     max_detection_range: 100.0        # 米，只对 LiDAR 周围 100m 水平半径内的残余点做漏标聚类；
                                         # 只影响 Cluster Detector，不影响 BBox 收集、Rule Report 或切帧。
     voxel_size: 0.2                  # 米，Voxel Downsample 网格大小。实测 31万点 -> 降到约5万点
@@ -247,40 +250,41 @@ rule_engine:
                                         # 帧里 54% 的点挤在 z∈[-0.38,0.22) 这个地面薄层，0.3 能把
                                         # 这一层滤掉，是这一帧点云自己坐标系里的绝对高度，不是
                                         # 拟合出来的地面）
-    max_height: 10.0                    # 米，Simple Height Filter 上限：只保留 z < 这个值的点。
-                                          # 参考表里最高的目标（岸桥/灯塔/场桥）也就 8m 量级，
-                                          # 10m 以上大概率是周围建筑物/高层结构，不太可能是漏标
-                                          # 目标——而且这类镂空结构容易被 DBSCAN 切成一堆小碎片，
-                                          # 是候选数量偏多的主要来源之一，真实数据验证过（frame 41
-                                          # 里占了 31 个候选的一处，就是一个附近没有任何 BBox、
-                                          # z 跨度到 15m 的结构）
-    eps: 0.4                           # 米，DBSCAN 邻域半径（体素化后点间距变大，取体素大小的2倍）
-    min_points: 5                       # DBSCAN 核心点的最小邻居数（体素化后点更稀疏，比不降采样时小）
+    max_height: null                    # 不再聚类前用固定绝对高度删除所有高点；高结构由合并后的
+                                          # 物理范围和体积约束处理。固定 z<10 曾删除真实竖直结构顶部。
+    clustering_method: "hdbscan"        # 0-100m 点密度差异显著，生产流程使用变密度层次聚类。
+    hdbscan_min_cluster_size: 12        # 最小叶簇点数；Frame 81 BBox 遮蔽回放对 18/18 已标目标有响应。
+    hdbscan_min_samples: 4              # 核心密度稳健度；与 min_cluster_size 分开配置。
+    hdbscan_cluster_selection_method: "leaf"  # 保留局部叶簇，再由受控 Fragment Merge 组合。
+    eps: 0.4                           # DBSCAN 兼容模式参数；仅 clustering_method=dbscan 时使用。
+    min_points: 5                      # DBSCAN 兼容模式参数；HDBSCAN 不读取此项。
     bbox_margin: 0.05                    # BBox 内部点判定的裕量比例，避免框边缘的真实点被误判成残留点
-    min_cluster_point_count: 25            # 聚类点数低于这个值，当噪声丢弃（从 15 调到 25，真实数据
-                                              # 验证过能有效减少候选数量，同时没有调 min_cluster_volume，
-                                              # 避免误杀雪糕筒（参考体积仅约 0.15m³）这类小目标）
-    min_cluster_volume: 0.05                 # 立方米，聚类 AABB 体积下限——特意保持不变，调大会把
-                                                # 雪糕筒大小的真实候选也滤掉
-    max_cluster_volume: 100.0                  # 立方米，聚类 AABB 体积上限（从 200 调到 100，配合
-                                                  # max_height 一起减少建筑物/大型背景结构被误判成候选）
-    min_flatness: 0.2                            # 形状扁平度下限（现在用 PCA 特征值算 linearity/
-                                                    # planarity 导出，不再是简单的 AABB 最短边/最长边比值，
-                                                    # 见 cluster_detector._shape_features），低于这个值
-                                                    # 当噪声丢弃——围栏杆/电缆/薄片结构这类明显不是
-                                                    # "敦实"三维物体的候选，这个值会很小。现在这项检查
-                                                    # 是在第二次聚类合并之后、对合并结果统一执行的，不是
-                                                    # 合并前对每个碎片单独执行（按用户要求调得比较激进，
-                                                    # 不特别照顾场桥/岸桥这类本身就细长的大型设备）
-    merge_distance: 1.5                          # 米，第二次 Cluster-level 聚类的合并距离阈值——现在是
-                                                    # 两个碎片 AABB 在 XY 平面上的最近距离（不是质心距离，
-                                                    # 也不看 Z 方向重叠，见 _pairwise_xy_gap_matrix），语义
-                                                    # 变了所以数值也从 3.0 收紧到 1.5（边界距离天然比质心
-                                                    # 距离小）。跟上面的 eps 是两回事，不能共用同一个值——
-                                                    # eps 要小、避免把相邻但不同的物体粘住；这个要大，
-                                                    # 才能把同一物体断裂的碎片重新连起来。故意不限制 Z 方向：
-                                                    # 灯塔/场桥/岸桥这类高瘦结构不同高度的碎片水平投影
-                                                    # 往往重合，但 Z 跨度可能有好几米，本该合并。
+    min_cluster_point_count: 15          # 遮蔽回放中 15 点仍保持 17/18 召回；20 点会降到 14/18。
+    min_cluster_volume: 0.001            # 仅删除数值上几乎退化为零体积的结果。
+    max_cluster_volume: 200.0            # 合并后物理体积兜底，不承担类别判断。
+    min_vertical_extent: 0.3             # 删除只剩地面薄层的组；遮蔽回放未降低 17/18 召回。
+    max_horizontal_aspect_ratio: 20.0    # 删除护栏/边线一类极端水平细长结构；不影响垂直灯塔。
+    low_height_threshold: 1.0            # 低于此高度时启用水平占地面积门禁。
+    max_low_height_horizontal_area: 12.0 # 删除成排设施或地面结构被合成的大面积低矮候选。
+    max_candidate_base_height: 15.0      # 允许结构顶部超过 15m，但整个 Cluster 的最低点若仍在
+                                          # 15m 以上则视为高空背景；避免恢复固定 z<10 截顶。
+    min_flatness: 0.0                    # PCA 形状保留为 Evidence，不再一票否决线状有效目标。
+    min_pca_thickness_ratio: 0.0          # Thickness 保留为 Evidence，不再一票否决单面可见目标。
+    min_cluster_confidence: 0.0           # 不按 HDBSCAN 概率硬删；低概率候选降为 Suspicious。
+    high_confidence_threshold: 0.8        # HDBSCAN 平均 membership probability 达到此值时标为 Possible。
+    spatial_dedup_distance: 1.0                  # 米，不同采样帧候选中心在此距离内时，报告视为同一
+                                                    # 固定 Cluster，合并为一条并记录 first/last frame、
+                                                    # occurrence_count 和 observed_frames。只影响报告去重，
+                                                    # 不影响逐帧 Cluster 和 Projection。
+    merge_distance: 0.3                  # HDBSCAN 叶簇的 XY AABB Gap；真实回放保持 17/18 召回，
+                                          # 同时避免 0.8m 合并造成真实叶簇进入大型链式组。
+    merge_max_z_gap: 1.0                 # 普通碎片还需 Z 间隔不超过 1m；XY footprint 真重叠时例外。
+    vertical_merge_min_xy_overlap: 0.05  # 上下断裂结构需在 X/Y 两轴都至少重叠 5cm 才跨高度合并。
+    weak_fragment_overlap_only: false    # 不再因一个弱桥整组删除；由受控 Z/XY 合并边和物理上限兜底。
+    preserve_fragments_on_merge_reject: false # 保留诊断开关但生产关闭；释放大型组全部叶簇会让
+                                               # Frame 81 膨胀到 287 个候选和 280 个 ROI。
+    weak_fragment_min_xy_overlap: 0.05           # 米，弱碎片与其他碎片的 X/Y footprint 两个方向都至少
+                                                    # 重叠这个距离时，该连接才不会触发整组合并拒绝。
     max_merged_extent: 30.0                      # 米，合并后 AABB 最长边的上限，超过就整条丢弃——第二次
                                                     # 聚类的合并判据具备链式传递性（A-B、B-C 各自在
                                                     # merge_distance 内会连成一组，即使 A-C 相距较远），
@@ -288,9 +292,26 @@ rule_engine:
                                                     # 覆盖岸桥（25m 长）这种最大的合法目标。
 
 # -------------------------------------------------------------
+# Cluster Projection：仅处理命中 assets.sample_interval、且 PCD/JPG/BBox 均成功的帧。
+# Calibration YAML 由 UI 在本次运行时传入，不写进 config.yaml。
+# 原始 JPG 保留在 images/，画框后的 JPG 保存到每帧独立的新子目录。
+# -------------------------------------------------------------
+projection:
+  enabled: true
+  output_dirname: "projection_debug"
+  min_depth: 0.1
+  min_visible_points: 3
+  padding_px: 8
+  line_width: 1                      # Projection Debug JPG 矩形描边像素；不改变 ROI 几何范围。
+  wrong_annotation:
+    enabled: true                    # Existing BBox 与漏标 Cluster 使用同一批采样帧和相机。
+    edge_samples: 9                  # 每条 BBox 边的三维采样点数；投影数学仍复用 project_points。
+    min_visible_points: 3
+    padding_px: 8
+
+# -------------------------------------------------------------
 # 报告设置（report.py）
-# capture_report.csv 汇总每帧的切帧状态、就绪状态、PCD/JPG 数量、截图路径，
-# 以及判断分析阶段（analyze.py）要用到的 ai_status 等占位字段。
+# capture_report.csv 汇总实际质检帧的切帧状态、就绪状态、PCD/JPG 数量和截图路径。
 # -------------------------------------------------------------
 report:
   output_dir: "outputs/reports"
@@ -306,8 +327,8 @@ assets:
   # 保存目录，跟 outputs/ 完全独立，不放进 reports 也不放进 bbox 数据里
   output_dir: "assets"
   # 每隔多少帧下载一次 PCD/JPG 文件本体，只影响 Assets 下载数量，
-  # 不影响 BBox 采集 / Rule Engine / Report（那几个仍然按当前逻辑跑完整 frame_count）。
-  # 例如 81 帧、sample_interval=10 时，只下载第 1/11/21/.../81 帧的 Assets。
+  # 不影响 BBox 采集 / Rule Engine / Report（它们仍处理全部实际质检帧，即默认 Frame 2 起）。
+  # 默认跳过首帧后，81 帧、sample_interval=10 时下载第 2/12/22/.../72 帧的 Assets。
   # 改成 1 表示每一帧都下载。
   sample_interval: 10
   download_pcd: true
@@ -326,10 +347,93 @@ analysis:
   enabled_analyzers: []   # 例如以后填 ["rules", "ai_vision"]
 
 # -------------------------------------------------------------
-# AI 视觉分析预留接口（第一版不启用）
+# 单 Cluster Vision 输入：只消费现有 Cluster Projection，不修改原始 JPG。
+# 测试限制在图片生成前应用，避免为未选中的候选复制整张 context 图片。
+# -------------------------------------------------------------
+ai_inputs:
+  enabled: true
+  output_dir: "ai_inputs"
+  crop_expand_ratio: 0.50            # ROI 四周各扩展自身宽/高的 50%，并裁到图片边界。
+  crop_expand_ratio_by_candidate:
+    residual_cluster: 0.20           # 漏标候选减少邻近目标混入；context 图仍保留完整场景。
+    existing_bbox: 0.25              # 错标 crop 减少邻近车辆/设施混入；context 仍保留完整场景。
+  jpeg_quality: 92
+  context_line_width: 2
+  quality:
+    min_roi_area_px: 400
+    min_roi_width_px: 48
+    min_roi_height_px: 32
+    max_roi_area_ratio: 0.50
+    min_visible_points: 8
+    edge_margin_px: 2
+    max_border_touch_sides: 1
+  quality_by_candidate:
+    existing_bbox:
+      min_roi_area_px: 2500
+      min_roi_width_px: 64
+      min_roi_height_px: 48
+      max_roi_area_ratio: 0.65
+      min_visible_points: 12
+      edge_margin_px: 2
+      max_border_touch_sides: 2
+
+# -------------------------------------------------------------
+# Qwen-VL：V1.0 默认启用；API Key 从项目根目录 .env 或同名环境变量读取。
+# API Key 只读取 api_key_env 指定的环境变量，绝不写入 YAML 或仓库。
+# api_base 具有地域/Workspace 差异，启用前必须填写实际兼容模式地址。
+# vision_test_limit=0 表示正式运行审核全部可用 Cluster；测试时可临时设置上限。
 # -------------------------------------------------------------
 ai_vision:
-  enabled: false
-  # 后续接入视觉模型时在这里填写相关配置（模型名、endpoint 等）
-  provider: ""
-  model: ""
+  enabled: true
+  provider: "qwen"
+  model_name: "qwen3-vl-plus"
+  category_whitelist_path: "config/vision_categories.yaml"  # 来自车辆及设施尺寸参考表.xlsx
+  api_base: "https://ws-vcvh6mb9582en9ic.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+  api_key_env: "DASHSCOPE_API_KEY"
+  timeout: 60
+  max_retries: 2
+  retry_delay_seconds: 1.0
+  use_environment_proxy: false       # 避免继承终端里的 socks:// 浏览器代理；需要时可显式改 true。
+  vision_workers: 2                  # 独立 Candidate 两路并发；报告仍按原任务顺序汇总。
+  cache:
+    enabled: true                    # 相同模型/Prompt/Metadata/图片重跑时不重复调用 API。
+    dirname: ".vision_cache"         # 位于 ai_inputs/scene_<id>/ 下，Cleanup 会随 Scene 删除。
+    schema_version: "vision-cache-v1"
+  vision_test_limit: 0
+  uncertain_confidence_threshold: 0.60
+  missing_annotation:
+    confidence_threshold: 0.92       # Qwen 自报置信度未校准；0.95 在真实回放中造成断崖式漏检。
+    temporal_dedup:
+      enabled: true                  # Vision 前去重；不改变 Cluster 检测和 Projection 结果。
+      registration:
+        min_common_tracks: 6         # 用同 Track ID 的已有 BBox 估计采样帧间自车运动。
+        min_inliers: 4
+        min_inlier_ratio: 0.50       # RANSAC 排除真实运动目标及异常 Track。
+        inlier_threshold_m: 0.50
+        max_hypotheses: 5000
+      matching:
+        min_observations: 3          # 至少 3 个采样帧稳定出现才减少 API；允许中间帧未成簇。
+        max_center_step_m: 0.30      # 坐标已补偿自车运动；不直接比较原始 LiDAR 坐标。
+        max_center_diameter_m: 0.50  # 限制整组范围，防止链式合并附近不同物体。
+        max_z_delta_m: 0.50
+        max_size_ratio: 3.00
+        max_pca_distance: 0.50
+    category_size_gate:
+      enabled: true
+      min_axis_ratio: 0.10           # Residual 点云可能不完整；低于参考尺寸 10% 才按局部碎片排除。
+      max_axis_ratio: 2.00           # Cluster 任一轴不得超过表格参考尺寸的 2.0 倍。
+  wrong_annotation:
+    enabled: true
+    vision_test_limit: 0             # 0=检查全部 Track；同一 track_id 只选择投影质量最佳的一帧。
+    confidence_threshold: 0.90       # Qwen 自报置信度只作为必要条件，不单独决定报告准入。
+    aggregation_mode: "per_frame"   # 对每个 Track 选中的单个代表帧独立判断。
+    min_consistent_observations: 2   # 仅 aggregation_mode=track_consensus 时使用。
+    min_consensus_ratio: 0.67        # 仅 track_consensus 时使用；错误票需达到 67%。
+    label_aliases:
+      托架: "卡车拖架"
+      平台车1: "平台车"
+      皮带车: "行李传送带车"
+      车辆: "其他车辆"
+      其他车: "其他车辆"
+      飞机拖车A: "飞机拖车甲型"
+      飞机拖车B: "飞机拖车乙型"

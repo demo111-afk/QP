@@ -1,5 +1,8 @@
 __pycache__/
 *.pyc
+*.pyo
+.pytest_cache/
+.coverage
 outputs/screenshots/*
 outputs/reports/*
 !outputs/screenshots/.gitkeep
@@ -8,15 +11,11 @@ outputs/reports/*
 # Assets Downloader 产出（PCD/JPG 文件本体，体积大，不入库）
 assets/*
 !assets/.gitkeep
+ai_inputs/
 .venv/
 venv/
 env/
 ENV/
 
-__pycache__/
-*.pyc
-*.pyo
-
 .env
 *.log
-

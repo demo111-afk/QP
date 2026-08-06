@@ -16,6 +16,7 @@ exposed as metadata and can return multiple cameras.
 
 from __future__ import annotations
 
+import argparse
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -217,14 +218,35 @@ class CalibrationLoader:
         else:
             text = source.read_text(encoding="utf-8")
 
-        data = yaml.safe_load(text) or {}
+        return cls.loads(text)
+
+    @classmethod
+    def loads(cls, text: str) -> CalibrationManager:
+        """Load pasted YAML text into the same structured objects as file loading."""
+        if not text or not text.strip():
+            raise CalibrationError("Calibration YAML is empty")
+        try:
+            data = yaml.safe_load(text)
+        except yaml.YAMLError as exc:
+            raise CalibrationError(f"Invalid Calibration YAML: {exc}") from exc
+        if not isinstance(data, dict):
+            raise CalibrationError("Calibration YAML root must be a mapping")
         return cls.from_dict(data)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CalibrationManager:
-        sensors = ((data.get("hardware") or {}).get("sensors") or {})
+        hardware = data.get("hardware") or {}
+        if not isinstance(hardware, dict):
+            raise CalibrationError("hardware must be a mapping")
+        sensors = hardware.get("sensors") or {}
+        if not isinstance(sensors, dict):
+            raise CalibrationError("hardware.sensors must be a mapping")
         cameras_raw = sensors.get("cameras") or {}
+        if not isinstance(cameras_raw, dict):
+            raise CalibrationError("hardware.sensors.cameras must be a mapping")
         camera_labels = sensors.get("camera_labels") or list(cameras_raw.keys())
+        if not isinstance(camera_labels, list):
+            raise CalibrationError("hardware.sensors.camera_labels must be a list")
 
         cameras = []
         for camera_id in camera_labels:
@@ -240,6 +262,8 @@ class CalibrationLoader:
                 cameras.append(cls._parse_camera(str(camera_id), raw))
 
         lidars_raw = sensors.get("lidars") or {}
+        if not isinstance(lidars_raw, dict):
+            raise CalibrationError("hardware.sensors.lidars must be a mapping")
         lidars = tuple(cls._parse_lidar(str(lidar_id), raw) for lidar_id, raw in lidars_raw.items())
 
         return CalibrationManager(
@@ -327,9 +351,14 @@ class CalibrationLoader:
         )
 
 
-def load_calibration(path: str | Path = "cali.wps") -> CalibrationManager:
+def load_calibration(path: str | Path) -> CalibrationManager:
     """Load calibration data from a YAML/YML file or the current WPS export."""
     return CalibrationLoader.load(path)
+
+
+def load_calibration_text(text: str) -> CalibrationManager:
+    """Load Calibration YAML pasted by the UI."""
+    return CalibrationLoader.loads(text)
 
 
 def _expect_float_list(values: list[Any], expected_len: int, field_name: str) -> tuple[float, ...]:
@@ -374,5 +403,8 @@ def _format_matrix(rows: Iterable[Iterable[float]] | None) -> list[str]:
 
 
 if __name__ == "__main__":
-    manager = load_calibration()
+    parser = argparse.ArgumentParser(description="Print a Calibration YAML/WPS summary.")
+    parser.add_argument("calibration", help="Calibration YAML/YML/WPS path")
+    args = parser.parse_args()
+    manager = load_calibration(args.calibration)
     print(manager.summary())

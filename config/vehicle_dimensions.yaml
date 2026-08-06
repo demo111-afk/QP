@@ -1,5 +1,10 @@
 # vehicle_dimensions.yaml
-# 车辆/设施尺寸参考库，数据来自《车辆及设施尺寸参考表.xlsx》，单位：米。
+# 车辆/设施尺寸参考库，单位：米。
+# 优先数据源：Scene 25204（2026-08-03）和 Scene 29694（2026-08-06）的实际 bbox_data.csv，
+# 未出现类别保留原参考表数据。
+# 实测更新方法：先对同一 className + track_id 的所有帧取中位数，再对类别内各 Track
+# 等权取中位数，避免长 Track 因帧数更多而支配结果。当前 2549 行、47 个 Label-Track，
+# 每个 Track 的 scale_x/y/z 在观测帧内均保持不变。
 #
 # 结构（每个类别）：
 #   id             对照原表的"序号"，方便回查源表
@@ -19,8 +24,11 @@
 #                  以后只改这里的 tolerance，判断范围自动更新，不需要改 reference_size，
 #                  也不需要改代码。
 #
-# 有 2 种形态（比如"带箱体"/"不带箱体"）的原表类别，拆成两个类别名（用下划线区分），
-# 因为同一个类别名不能对应两组不同的参考尺寸。
+# 2026-08-06 operational setting: all categories with a reference size use tolerance=0.50
+# on every axis, meaning Reference Size ±50%. Categories without a fixed reference remain null.
+#
+# 同一平台 Label 存在多种真实尺寸时，用下划线拆成变体。Scene 25204 的托架按用户确认和
+# 实测高度状态拆为高型/低型；平板车、自身拖挂车仍保留原表带箱体/不带箱体变体。
 #
 # 说明（原表脚注）：给定标准尺寸来自实测/既定标准；常见参考值只适合做尺寸异常初筛，
 # 不应直接作为严格判错阈值；其他车辆及组合车辆应以实际完整扫描尺寸为准。
@@ -28,199 +36,213 @@
 classes:
   雪糕筒:
     id: 1
-    note: ""
+    note: "Scene 25204 实测 5 Track；包含1个局部轴向不同的0.75m长度样本，Reference length校准为0.50m以适配±50%"
     size_basis: "given_standard"
-    reference_size: {length: 0.45, width: 0.45, height: 0.75}
-    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+    reference_size: {length: 0.50, width: 0.45, height: 0.75}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
 
   行人:
     id: 2
     note: "参考尺寸按真实抓取数据回校，平台的 BBox 比人体实际尺寸偏大（可能包含行走摆臂等余量），原表 0.4/0.5/1.7 跟平台实际偏差较大"
     size_basis: "given_standard"
     reference_size: {length: 0.9, width: 0.85, height: 1.8}
-    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
 
   轿车:
     id: 3
-    note: "常见乘用轿车（参考尺寸按真实抓取数据回校，原表 4.8/1.9/1.6 跟平台实际偏差较大）"
+    note: "Scene 29694 实测 1 Track；当前值采用最新真实 Scene，样本仍需继续积累"
     size_basis: "common_reference"
-    reference_size: {length: 5.7, width: 2.3, height: 2.1}
-    tolerance: {length: 0.30, width: 0.30, height: 0.20}
+    reference_size: {length: 4.58, width: 1.95, height: 1.60}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
 
   卡车头:
     id: 4
-    note: ""
+    note: "Scene 29694 实测 9 Track；每 Track 中位数后类别等权中位数"
     size_basis: "given_standard"
-    reference_size: {length: 4.5, width: 3.0, height: 3.5}
-    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+    reference_size: {length: 4.24, width: 3.23, height: 3.49}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
 
-  托架_带箱体:
+  托架_高型:
     id: 5
-    note: "带箱体（原表类别名为卡车拖架，平台 className 实际标注为托架，不区分带/不带箱体）"
-    size_basis: "given_standard"
-    reference_size: {length: 13.5, width: 3.0, height: 4.0}
-    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+    note: "平台 Label 均为托架；高型覆盖 Scene 25204、29694 与 29696 的真实尺寸范围，仍作为一个变体处理"
+    size_basis: "common_reference"
+    reference_size: {length: 10.50, width: 2.75, height: 3.20}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
 
-  托架_不带箱体:
+  托架_低型:
     id: 5
-    note: "不带箱体（原表类别名为卡车拖架，平台 className 实际标注为托架，不区分带/不带箱体）"
-    size_basis: "given_standard"
-    reference_size: {length: 13.5, width: 3.0, height: 1.5}
-    tolerance: {length: 0.20, width: 0.20, height: 0.20}
-
-  托架_小_带箱体:
-    id: 5
-    note: "小托架，带箱体（真实数据里跟大托架是同一个 className托架，尺寸差很多，单独加一条参考尺寸；带箱体高度 4.0m 由用户确认）"
-    size_basis: "given_standard"
-    reference_size: {length: 4.7, width: 3.0, height: 4.0}
-    tolerance: {length: 0.20, width: 0.20, height: 0.20}
-
-  托架_小_不带箱体:
-    id: 5
-    note: "小托架，不带箱体（真实数据实测约 4.66×3.0×0.75m，四舍五入取整）"
-    size_basis: "given_standard"
-    reference_size: {length: 4.7, width: 3.0, height: 0.8}
-    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+    note: "平台 Label 均为托架；低型覆盖 Scene 25204 与 29694 的真实尺寸范围，仍作为一个变体处理"
+    size_basis: "common_reference"
+    reference_size: {length: 9.50, width: 3.00, height: 1.10}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
 
   平板车_带箱体:
     id: 6
     note: "带箱体"
     size_basis: "given_standard"
     reference_size: {length: 15.0, width: 3.0, height: 4.0}
-    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
 
   平板车_不带箱体:
     id: 6
     note: "不带箱体"
     size_basis: "given_standard"
     reference_size: {length: 15.0, width: 3.0, height: 1.5}
-    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
 
   锁站:
     id: 7
     note: ""
     size_basis: "given_standard"
     reference_size: {length: 3.0, width: 1.8, height: 1.5}
-    tolerance: {length: 0.30, width: 0.30, height: 0.20}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
 
   灯塔:
     id: 8
-    note: ""
+    note: "Scene 29694 与 29696 真实 BBox 回校；底面存在约1.5m至2.5m差异，高度为8.0m"
     size_basis: "given_standard"
-    reference_size: {length: 2, width: 2, height: 8.0}
-    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+    reference_size: {length: 2.00, width: 2.00, height: 8.0}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
 
   场桥:
     id: 9
     note: "轮胎吊或轨道吊"
     size_basis: "given_standard"
     reference_size: {length: 14.0, width: 1.6, height: 8.0}
-    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
+
+  场桥 轮胎吊 轨道吊:
+    id: 9
+    note: "Scene 29694 平台完整 Label，实测6 Track；与场桥为别名但保留真实 className 以直接匹配"
+    size_basis: "given_standard"
+    reference_size: {length: 12.10, width: 2.92, height: 8.00}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
 
   岸桥:
     id: 10
     note: ""
     size_basis: "given_standard"
     reference_size: {length: 25.0, width: 3.0, height: 8.0}
-    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
 
   自身拖挂车_带箱体:
     id: 11
     note: "带箱体，参考卡车拖架"
     size_basis: "given_standard"
     reference_size: {length: 13.5, width: 3.0, height: 4.0}
-    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
 
   自身拖挂车_不带箱体:
     id: 11
     note: "不带箱体，参考卡车拖架"
     size_basis: "given_standard"
     reference_size: {length: 13.5, width: 3.0, height: 1.5}
-    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
 
   其他车:
     id: 12
-    note: "以该序列扫描完整尺寸为准（原表类别名为其他车辆，平台 className 实际标注为其他车）"
-    size_basis: "no_fixed_value"
-    reference_size: {length: null, width: null, height: null}
-    tolerance: {length: null, width: null, height: null}
-
-  工程车:
-    id: 13
-    note: "一般工程作业车辆"
+    note: "Scene 25204 平台 Label=车辆，实测 2 Track；供 Vision 标准类别其他车辆使用"
     size_basis: "common_reference"
-    reference_size: {length: 6.0, width: 2.5, height: 3.0}
-    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+    reference_size: {length: 8.37, width: 3.07, height: 2.80}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
+
+  车辆:
+    id: 12
+    note: "Scene 25204 平台原始 Label，实测 2 Track；与 Vision 标准类别其他车辆共用参考"
+    size_basis: "common_reference"
+    reference_size: {length: 8.37, width: 3.07, height: 2.80}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
+
+  工程车_常规:
+    id: 13
+    note: "平台 Label=工程车；Scene 25204 实测5 Track的常规尺寸变体"
+    size_basis: "common_reference"
+    reference_size: {length: 7.36, width: 2.80, height: 3.16}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
+
+  工程车_大型港区设备:
+    id: 13
+    note: "平台 Label=工程车；Scene 29694 实测8 Track的大型港区设备尺寸变体"
+    size_basis: "common_reference"
+    reference_size: {length: 20.92, width: 3.02, height: 8.00}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
 
   大巴车:
     id: 14
-    note: "常见大型客车"
+    note: "Scene 29694 实测1 Track；样本较少，后续 Scene 继续回校"
     size_basis: "common_reference"
-    reference_size: {length: 12.0, width: 2.55, height: 3.5}
-    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+    reference_size: {length: 6.96, width: 2.53, height: 2.74}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
 
   叉车:
     id: 15
     note: "常见中型叉车（参考尺寸按真实抓取数据回校，原表 3.5/1.5/2.3 跟平台实际偏差较大）"
     size_basis: "common_reference"
     reference_size: {length: 4.9, width: 2.3, height: 2.2}
-    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
 
   吊车:
     id: 16
     note: "按车体尺寸，吊臂不完全展开"
     size_basis: "common_reference"
     reference_size: {length: 12.0, width: 3.0, height: 3.8}
-    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
 
   货车:
     id: 17
-    note: "常见中型厢式或栏板货车"
+    note: "Scene 25204 实测 2 Track；轨迹等权中位数"
     size_basis: "common_reference"
-    reference_size: {length: 7.0, width: 2.5, height: 3.2}
-    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+    reference_size: {length: 6.72, width: 2.54, height: 3.06}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
 
   登高车:
     id: 18
     note: "按完整车体尺寸"
     size_basis: "common_reference"
     reference_size: {length: 6.0, width: 2.2, height: 3.0}
-    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
 
   牵引车:
     id: 19
-    note: "港区或物流牵引车（参考尺寸按真实抓取数据回校，原表 5.5/2.5/3.0 跟平台实际偏差较大）"
+    note: "Scene 25204 实测 4 Track；轨迹等权中位数"
     size_basis: "common_reference"
-    reference_size: {length: 3.5, width: 2.2, height: 2.1}
-    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+    reference_size: {length: 2.88, width: 1.70, height: 2.13}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
 
   飞机拖车A:
     id: 20
     note: "较小型飞机牵引车（原表类别名为飞机拖车甲型，平台 className 实际标注为飞机拖车A；参考尺寸按真实抓取数据回校，原表 4.5/2.2/1.8 跟平台实际偏差较大）"
     size_basis: "common_reference"
     reference_size: {length: 7.1, width: 3.3, height: 2.1}
-    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
 
   飞机拖车B:
     id: 21
     note: "较大型飞机牵引车（原表类别名为飞机拖车乙型，平台 className 命名格式推测为飞机拖车B，尚未在真实数据中观察到，需要之后确认）"
     size_basis: "common_reference"
     reference_size: {length: 6.0, width: 3.0, height: 2.0}
-    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
 
   云梯车:
     id: 22
     note: "条件允许尽量包含云梯"
     size_basis: "common_reference"
     reference_size: {length: 10.0, width: 2.5, height: 3.5}
-    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
 
   行李传送带车:
     id: 23
-    note: "按完整车体及收拢传送带"
+    note: "Scene 25204 平台 Label=皮带车，实测 1 Track；样本较少"
     size_basis: "common_reference"
-    reference_size: {length: 8.0, width: 2.5, height: 3.0}
-    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+    reference_size: {length: 7.65, width: 2.44, height: 1.95}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
+
+  皮带车:
+    id: 23
+    note: "Scene 25204 平台原始 Label，实测 1 Track；与行李传送带车共用参考"
+    size_basis: "common_reference"
+    reference_size: {length: 7.65, width: 2.44, height: 1.95}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
 
   卡车拖架与其他车辆组合:
     id: 24
@@ -234,46 +256,53 @@ classes:
     note: ""
     size_basis: "common_reference"
     reference_size: {length: 1.8, width: 0.65, height: 1.1}
-    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
 
   自行车_有人:
     id: 26
     note: ""
     size_basis: "common_reference"
     reference_size: {length: 1.8, width: 0.65, height: 1.8}
-    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
 
   摩托车_无人:
     id: 27
     note: ""
     size_basis: "common_reference"
     reference_size: {length: 2.1, width: 0.8, height: 1.2}
-    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
 
   摩托车_有人:
     id: 28
     note: ""
     size_basis: "common_reference"
     reference_size: {length: 2.1, width: 0.8, height: 1.8}
-    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
 
   三轮车_无人:
     id: 29
     note: "按完整扫描尺寸"
     size_basis: "common_reference"
     reference_size: {length: 2.8, width: 1.2, height: 1.5}
-    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
 
   三轮车_有人:
     id: 30
     note: ""
     size_basis: "common_reference"
     reference_size: {length: 2.8, width: 1.2, height: 1.8}
-    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
 
   平台车:
     id: 31
-    note: "常见机场或港区装卸平台车"
+    note: "Scene 25204 平台 Label=平台车1，实测 1 Track；样本较少"
     size_basis: "common_reference"
-    reference_size: {length: 7.0, width: 3.0, height: 2.5}
-    tolerance: {length: 0.20, width: 0.20, height: 0.20}
+    reference_size: {length: 9.29, width: 4.26, height: 3.50}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}
+
+  平台车1:
+    id: 31
+    note: "Scene 25204 平台原始 Label，实测 1 Track；与 Vision 标准类别平台车共用参考"
+    size_basis: "common_reference"
+    reference_size: {length: 9.29, width: 4.26, height: 3.50}
+    tolerance: {length: 0.50, width: 0.50, height: 0.50}

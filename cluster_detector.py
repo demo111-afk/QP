@@ -17,6 +17,9 @@ rule_report.csv，两者职责分开）：
     Residual Point Cloud（剩余点云）
      |
      v
+    remove_ego_points()：删除车体/传感器安装区域内重复出现的固定近场回波
+     |
+     v
     range_filter()：只保留 LiDAR 周围 max_detection_range 米水平半径内的点
      |
      v
@@ -27,24 +30,21 @@ rule_report.csv，两者职责分开）：
      |    （这不是完整 Ground Removal——没有 RANSAC/平面拟合/CSF/Patchwork++，
      |     只是点云预处理，目的仅仅是让 DBSCAN 的输入规模降到能跑得动）
      v
-    第一次 DBSCAN（eps 较小，只用 x/y/z，不用 intensity）：精细但容易把一个真实物体
-     |    因为遮挡/稀疏回波/BBox 裕量削点等原因切成好几个局部碎片——这是刻意的代价，
-     |    不是参数没调好，避免把两个真实独立的物体粘连成一个。
+    第一级点聚类（生产使用 HDBSCAN Leaf；DBSCAN 作为兼容模式）：只用 x/y/z，
+     |    HDBSCAN 适应 0-100m 的近密远疏回波，并保留局部叶簇供后续受控合并。
      v
-    宽松初筛：只丢弃 DBSCAN 自己判定的噪声（-1），不做任何点数/体积/扁平度判断——
+    宽松初筛：只丢弃聚类器判定的噪声（-1），不做最终点数/体积判断——
      |    严格几何过滤放到第二次聚类合并之后，避免在合并前就误杀本该合并的碎片。
      v
-    第二次 Cluster-level 聚类（_merge_nearby_candidates）：按碎片 AABB 在 XY 平面上的
-     |    最近距离合并（不是质心距离，也不看 Z 重叠——灯塔/场桥/岸桥这类高瘦结构不同
-     |    高度的碎片本该合并）。合并后用真实点重新计算 point_count/centroid/AABB/
-     |    volume/flatness（PCA 特征值），统一跑一轮严格过滤（含合并后整体尺寸上限，
-     |    挡住链式合并出的不合理结果），不管候选是不是被合并过都要过这一关。
+    第二次 Cluster-level 聚类（_merge_nearby_candidates）：按碎片 AABB 的 XY Gap 合并，
+     |    同时要求 Z 接近，或 XY footprint 真正重叠才允许跨高度连接。合并后用真实点重新
+     |    计算 point_count/centroid/AABB/volume/PCA，并执行物理范围兜底。
      v
     ClusterCandidate 列表（status 固定是 "Possible Missing Annotation" 或
     "Suspicious Residual Cluster"，不判断类别、不调用 Vision/LLM）
 
 背景：真实数据实测过，如果跳过 voxel_downsample/height_filter 直接对全场景残留点云
-（30万级点，其中一半以上是地面）跑 DBSCAN，sklearn 在算近邻列表时会直接内存溢出——
+（30万级点，其中一半以上是地面）跑邻域聚类，近邻计算会占用过多内存——
 地面点密度极高，任何一个点附近可能有成百上千个邻居。这两步预处理是让流程在真实点云
 规模下能跑通的必要条件，不是可选优化。
 
@@ -63,7 +63,7 @@ import struct
 from dataclasses import dataclass, field
 
 import numpy as np
-from sklearn.cluster import DBSCAN
+from sklearn.cluster import DBSCAN, HDBSCAN
 
 # PCD FIELDS 的 (TYPE, SIZE) -> numpy dtype 映射，ascii/binary/binary_compressed 三种模式共用。
 _PCD_TYPE_MAP = {
@@ -121,11 +121,15 @@ class ClusterCandidate:
     有多近"，不是"这是什么物体"。"""
     cluster_id: str
     point_indices: list = field(default_factory=list)   # 在体素降采样+高度过滤后点云里的行索引
+    points_xyz: np.ndarray | None = field(default=None, repr=False, compare=False)
     centroid: tuple[float, float, float] | None = None
     point_count: int = 0
     bbox_hint: dict | None = None    # 残留点的轴对齐包围盒：{"min":.., "max":.., "size":..}
     status: str = ""                  # "Possible Missing Annotation" | "Suspicious Residual Cluster"
     merged_fragment_count: int = 1     # 由几个原始 DBSCAN 碎片合并而来；1 表示没有被合并过
+    pca_thickness_ratio: float = 0.0   # PCA λ3/λ1；接近 0 表示只有二维表面、没有三维厚度
+    cluster_confidence: float = 1.0     # 聚类稳定度；DBSCAN 固定为 1，HDBSCAN 使用 membership probability
+    clustering_method: str = "dbscan"
 
 
 @dataclass
@@ -136,6 +140,7 @@ class _Fragment:
     indices: np.ndarray   # 在 filtered_points 里的行索引
     mins: np.ndarray
     maxs: np.ndarray
+    confidence: float = 1.0
 
 
 def _pairwise_xy_gap_matrix(mins: np.ndarray, maxs: np.ndarray) -> np.ndarray:
@@ -157,7 +162,108 @@ def _pairwise_xy_gap_matrix(mins: np.ndarray, maxs: np.ndarray) -> np.ndarray:
     return np.sqrt((gap ** 2).sum(axis=2))
 
 
-def _shape_features(points: np.ndarray) -> tuple[float, float]:
+def _fragment_merge_distance_matrix(
+    fragments: list[_Fragment],
+    merge_distance: float,
+    max_z_gap: float | None,
+    vertical_min_xy_overlap: float,
+) -> np.ndarray:
+    """Build a controlled fragment distance matrix.
+
+    Nearby fragments merge when their Z intervals are also nearby. Vertically
+    separated fragments may still merge when their XY footprints genuinely
+    overlap, which preserves broken poles/towers without allowing every nearby
+    XY fragment to bridge across arbitrary height.
+    """
+    mins = np.array([fragment.mins for fragment in fragments])
+    maxs = np.array([fragment.maxs for fragment in fragments])
+    distances = _pairwise_xy_gap_matrix(mins, maxs)
+    if max_z_gap is None or max_z_gap < 0:
+        return distances
+
+    z_gap = np.maximum(
+        0.0,
+        np.maximum(
+            mins[:, None, 2] - maxs[None, :, 2],
+            mins[None, :, 2] - maxs[:, None, 2],
+        ),
+    )
+    overlap = (
+        np.minimum(maxs[:, None, :2], maxs[None, :, :2])
+        - np.maximum(mins[:, None, :2], mins[None, :, :2])
+    )
+    footprint_overlap = np.all(overlap >= max(0.0, vertical_min_xy_overlap), axis=2)
+    allowed = (z_gap <= max_z_gap) | footprint_overlap
+    blocked_distance = max(merge_distance + 1.0, 1e6)
+    distances = np.where(allowed, distances, blocked_distance)
+    np.fill_diagonal(distances, 0.0)
+    return distances
+
+
+def _weak_fragment_gap_mask(
+    fragments: list[_Fragment],
+    filtered_points: np.ndarray,
+    config: dict,
+) -> np.ndarray:
+    """标出由弱碎片跨 XY 空隙形成的不可靠连接。"""
+    mins = np.array([fragment.mins for fragment in fragments])
+    maxs = np.array([fragment.maxs for fragment in fragments])
+    if not config.get("weak_fragment_overlap_only", True):
+        return np.zeros((len(fragments), len(fragments)), dtype=bool)
+
+    min_point_count = config.get("min_cluster_point_count", 15)
+    min_flatness = config.get("min_flatness", 0.25)
+    min_thickness_ratio = config.get("min_pca_thickness_ratio", 0.0)
+    weak = []
+    for fragment in fragments:
+        fragment_points = filtered_points[fragment.indices]
+        _, flatness, thickness_ratio = _shape_features(fragment_points)
+        weak.append(
+            len(fragment_points) < min_point_count
+            or flatness < min_flatness
+            or thickness_ratio < min_thickness_ratio
+        )
+    weak = np.asarray(weak, dtype=bool)
+
+    overlap = (
+        np.minimum(maxs[:, None, :2], maxs[None, :, :2])
+        - np.maximum(mins[:, None, :2], mins[None, :, :2])
+    )
+    min_overlap = max(0.0, float(config.get("weak_fragment_min_xy_overlap", 0.05)))
+    footprint_overlap = np.all(overlap >= min_overlap, axis=2)
+    blocked = (weak[:, None] | weak[None, :]) & ~footprint_overlap
+    np.fill_diagonal(blocked, False)
+    return blocked
+
+
+def _group_depends_on_weak_gap(
+    fragments: list[_Fragment],
+    filtered_points: np.ndarray,
+    merge_distance: float,
+    config: dict,
+) -> bool:
+    """判断移除弱碎片跨空隙的边后，原合并组是否会断开。"""
+    if len(fragments) < 2:
+        return False
+
+    mins = np.array([fragment.mins for fragment in fragments])
+    maxs = np.array([fragment.maxs for fragment in fragments])
+    distances = _pairwise_xy_gap_matrix(mins, maxs)
+    weak_gap_mask = _weak_fragment_gap_mask(fragments, filtered_points, config)
+    reliable_edges = (distances <= merge_distance) & ~weak_gap_mask
+
+    visited = np.zeros(len(fragments), dtype=bool)
+    pending = [0]
+    visited[0] = True
+    while pending:
+        current = pending.pop()
+        neighbors = np.flatnonzero(reliable_edges[current] & ~visited)
+        visited[neighbors] = True
+        pending.extend(int(index) for index in neighbors)
+    return not bool(np.all(visited))
+
+
+def _shape_features(points: np.ndarray) -> tuple[float, float, float]:
     """算一个点集的体积（AABB）和形状扁平度。
 
     扁平度用 PCA 特征值算：对点集做协方差矩阵特征分解，得到 λ1≥λ2≥λ3。
@@ -166,8 +272,8 @@ def _shape_features(points: np.ndarray) -> tuple[float, float]:
     flatness = 1 - max(linearity, planarity)，越接近 1 越像"敦实"的三维物体
     （三个方向的延展程度比较接近），越接近 0 越像退化的线状/面状结构。
 
-    这比单纯用"AABB 最短边/最长边"更准——一根斜着放置、没有对齐坐标轴的杆，
-    AABB 在 x/y 上可能看起来差不多方正，但 PCA 能正确识别出它其实是线状的。
+    flatness 对长宽不等的二维平面仍可能偏高，因此同时返回 thickness_ratio=λ3/λ1。
+    真正的薄平面无论朝向如何，最小方向方差都会接近 0，这个比值也会接近 0。
     """
     mins = points.min(axis=0)
     maxs = points.max(axis=0)
@@ -175,7 +281,7 @@ def _shape_features(points: np.ndarray) -> tuple[float, float]:
     volume = float(size[0] * size[1] * size[2])
 
     if len(points) < 3:
-        return volume, 0.0   # 点太少，PCA 不稳定，保守地当作最扁处理
+        return volume, 0.0, 0.0   # 点太少，PCA 不稳定，保守地当作最扁处理
 
     centered = points - points.mean(axis=0)
     cov = (centered.T @ centered) / len(points)
@@ -183,12 +289,13 @@ def _shape_features(points: np.ndarray) -> tuple[float, float]:
     lam3, lam2, lam1 = eigenvalues
 
     if lam1 <= 1e-12:
-        return volume, 0.0
+        return volume, 0.0, 0.0
 
     linearity = (lam1 - lam2) / lam1
     planarity = (lam2 - lam3) / lam1
     flatness = 1.0 - max(linearity, planarity)
-    return volume, float(flatness)
+    thickness_ratio = lam3 / lam1
+    return volume, float(flatness), float(thickness_ratio)
 
 
 def _euler_xyz_to_matrix(rx: float, ry: float, rz: float) -> np.ndarray:
@@ -264,6 +371,25 @@ def range_filter(points: np.ndarray, max_range: float | None = None) -> np.ndarr
         return points
     xy_distance = np.sqrt(points[:, 0] ** 2 + points[:, 1] ** 2)
     return points[xy_distance <= max_range]
+
+
+def remove_ego_points(points: np.ndarray, exclusion_box: dict | None = None) -> np.ndarray:
+    """删除车体/传感器安装区域内的固定近场回波。"""
+    if points.shape[0] == 0 or not exclusion_box or not exclusion_box.get("enabled", False):
+        return points
+
+    min_bounds = np.array([
+        exclusion_box.get("min_x", -2.0),
+        exclusion_box.get("min_y", -1.2),
+        exclusion_box.get("min_z", -1.0),
+    ], dtype=np.float64)
+    max_bounds = np.array([
+        exclusion_box.get("max_x", 2.8),
+        exclusion_box.get("max_y", 1.2),
+        exclusion_box.get("max_z", 2.5),
+    ], dtype=np.float64)
+    inside_ego = np.all((points >= min_bounds) & (points <= max_bounds), axis=1)
+    return points[~inside_ego]
 
 
 def height_filter(points: np.ndarray, height_threshold: float, max_height: float | None = None) -> np.ndarray:
@@ -375,9 +501,60 @@ def _read_pcd(pcd_path: str) -> np.ndarray:
         raise ValueError(f"暂不支持的 PCD DATA 模式: {data_mode!r}（只支持 ascii/binary/binary_compressed）")
 
 
+def _cluster_point_fragments(points: np.ndarray, config: dict) -> tuple[list[_Fragment], str]:
+    """Cluster filtered points and return leaf fragments.
+
+    DBSCAN remains available for compatibility and focused tests. Production
+    can use HDBSCAN so one fixed radius is not forced onto the full 0-100 m
+    density range.
+    """
+    method = str(config.get("clustering_method", "dbscan")).strip().lower()
+    if method == "hdbscan":
+        min_cluster_size = max(2, int(config.get("hdbscan_min_cluster_size", 12)))
+        min_samples = max(1, int(config.get("hdbscan_min_samples", 4)))
+        selection_method = str(config.get("hdbscan_cluster_selection_method", "leaf")).strip().lower()
+        if selection_method not in {"leaf", "eom"}:
+            raise ValueError(
+                "cluster_detector.hdbscan_cluster_selection_method 必须是 'leaf' 或 'eom'"
+            )
+        model = HDBSCAN(
+            min_cluster_size=min_cluster_size,
+            min_samples=min_samples,
+            cluster_selection_method=selection_method,
+            copy=True,
+        ).fit(points)
+        labels = model.labels_
+        probabilities = model.probabilities_
+    elif method == "dbscan":
+        eps = float(config.get("eps", 0.4))
+        min_points = max(1, int(config.get("min_points", 5)))
+        labels = DBSCAN(eps=eps, min_samples=min_points).fit_predict(points)
+        probabilities = np.ones(len(points), dtype=np.float64)
+    else:
+        raise ValueError(
+            f"不支持的 cluster_detector.clustering_method={method!r}，"
+            "可选值为 'dbscan' 或 'hdbscan'"
+        )
+
+    fragments: list[_Fragment] = []
+    for label in sorted(set(labels)):
+        if label == -1:
+            continue
+        member_indices = np.where(labels == label)[0]
+        member_points = points[member_indices]
+        fragments.append(_Fragment(
+            label=int(label),
+            indices=member_indices,
+            mins=member_points.min(axis=0),
+            maxs=member_points.max(axis=0),
+            confidence=float(np.mean(probabilities[member_indices])),
+        ))
+    return fragments, method
+
+
 def detect_clusters(pcd_path: str, boxes: list[OrientedBox], config: dict) -> list[ClusterCandidate]:
-    """两级聚类：第一次 DBSCAN 精细分割（容易把一个真实物体拆成多个局部碎片），
-    第二次按碎片 AABB 的 XY 距离做 Cluster-level 合并，合并后统一做一轮严格几何复检。
+    """两级聚类：第一级使用配置的 HDBSCAN/DBSCAN 生成局部碎片，
+    第二级按受控 XY/Z 空间关系做 Cluster-level 合并并执行物理范围复检。
 
     不判断类别、不调用 Vision/LLM——每个候选只有几何信息（点数/质心/AABB/形状）和一个
     固定的 status 字符串。
@@ -385,9 +562,10 @@ def detect_clusters(pcd_path: str, boxes: list[OrientedBox], config: dict) -> li
         pcd_path: assets_downloader.py 下载下来的本地 PCD 文件路径
                   （例如 assets/scene_xxx/frame_0011/pointcloud.pcd）
         boxes:    这一帧全部 BBox 转换成的 OrientedBox 列表（调用方负责从 bbox_data.csv 转换）
-        config:   config.yaml -> cluster_detector 这个子配置块（max_detection_range/voxel_size/
-                  height_threshold/max_height/eps/min_points/bbox_margin/merge_distance/max_merged_extent/
-                  min_cluster_point_count/min_cluster_volume/max_cluster_volume/min_flatness）
+        config:   config.yaml -> cluster_detector 这个子配置块（ego_exclusion_box/
+                  max_detection_range/voxel_size/height_threshold/max_height/clustering_method/
+                  bbox_margin/merge_distance/max_merged_extent/min_cluster_point_count/
+                  min_cluster_volume/max_cluster_volume/min_flatness/min_pca_thickness_ratio）
     """
     points = _read_pcd(pcd_path)
     if points.shape[0] == 0:
@@ -395,6 +573,10 @@ def detect_clusters(pcd_path: str, boxes: list[OrientedBox], config: dict) -> li
 
     margin = config.get("bbox_margin", 0.05)
     residual = remove_bbox_points(points, boxes, margin)
+    if residual.shape[0] == 0:
+        return []
+
+    residual = remove_ego_points(residual, config.get("ego_exclusion_box"))
     if residual.shape[0] == 0:
         return []
 
@@ -416,41 +598,22 @@ def detect_clusters(pcd_path: str, boxes: list[OrientedBox], config: dict) -> li
     if filtered_points.shape[0] == 0:
         return []
 
-    # ---- 第一次 DBSCAN：精细分割 ----
-    eps = config.get("eps", 0.4)
-    min_points = config.get("min_points", 5)
-    labels = DBSCAN(eps=eps, min_samples=min_points).fit_predict(filtered_points)
-
-    # 宽松初筛：只丢弃 DBSCAN 自己判定的噪声（-1）。不在这里做任何点数/体积/扁平度
-    # 判断——严格过滤放到合并之后统一执行，避免在合并前就误杀本该合并的碎片。
-    fragments: list[_Fragment] = []
-    for label in sorted(set(labels)):
-        if label == -1:
-            continue
-        member_indices = np.where(labels == label)[0]
-        member_points = filtered_points[member_indices]
-        fragments.append(_Fragment(
-            label=int(label),
-            indices=member_indices,
-            mins=member_points.min(axis=0),
-            maxs=member_points.max(axis=0),
-        ))
-
-    return _merge_nearby_candidates(fragments, filtered_points, config)
+    fragments, method = _cluster_point_fragments(filtered_points, config)
+    return _merge_nearby_candidates(fragments, filtered_points, config, clustering_method=method)
 
 
 def _merge_nearby_candidates(
-    fragments: list[_Fragment], filtered_points: np.ndarray, config: dict
+    fragments: list[_Fragment],
+    filtered_points: np.ndarray,
+    config: dict,
+    clustering_method: str = "dbscan",
 ) -> list[ClusterCandidate]:
-    """第二次 Cluster-level 聚类：把可能属于同一个真实实体、但被第一次 DBSCAN 拆开的碎片
+    """第二次 Cluster-level 聚类：把可能属于同一个真实实体、但被第一级聚类拆开的碎片
     重新合并，然后对合并结果（不管由 1 个还是多个碎片组成）统一做一轮严格几何复检。
 
-    合并判据：两个碎片的 AABB 在 XY 平面上的最近距离 <= merge_distance（见
-    _pairwise_xy_gap_matrix，不是质心距离，也不看 Z 方向重叠）。实现上复用 DBSCAN——
-    把两两之间的 XY 距离矩阵喂给 metric="precomputed"，min_samples=1 让每个碎片都能
-    自成一组。这个实现仍然具备链式传递性（A-B、B-C 各自在 eps 内会连成一组，即使
-    A-C 相距较远）——不打算消除传递性本身（任何基于连通分量的合并方式都有这个特性），
-    而是靠下面的 max_merged_extent 挡住链式合并出的不合理结果。
+    基础合并判据：两个碎片的 AABB XY Gap <= merge_distance，并且 Z Gap 接近；
+    XY footprint 真重叠时可跨高度合并。实现上复用 DBSCAN 的 precomputed 距离矩阵和
+    min_samples=1，最终由 max_merged_extent 和 volume 限制不合理链式跨度。
 
     合并后用真实点（不是包围盒角点）重新计算 point_count/centroid/AABB/volume/flatness，
     再统一跑一次严格过滤——这一轮过滤对"没有被合并、自己单独成一组"的候选同样生效，
@@ -463,70 +626,142 @@ def _merge_nearby_candidates(
     min_volume = config.get("min_cluster_volume", 0.05)
     max_volume = config.get("max_cluster_volume", 200.0)
     min_flatness = config.get("min_flatness", 0.25)
+    min_thickness_ratio = config.get("min_pca_thickness_ratio", 0.0)
+    min_vertical_extent = max(0.0, float(config.get("min_vertical_extent", 0.0)))
+    min_cluster_confidence = max(0.0, float(config.get("min_cluster_confidence", 0.0)))
+    max_candidate_base_height = config.get("max_candidate_base_height")
+    max_candidate_base_height = (
+        None if max_candidate_base_height is None else float(max_candidate_base_height)
+    )
     max_merged_extent = config.get("max_merged_extent", 30.0)
+    merge_distance = config.get("merge_distance", 1.5)
 
     if len(fragments) == 1:
         group_labels = np.array([0])
     else:
-        mins = np.array([f.mins for f in fragments])
-        maxs = np.array([f.maxs for f in fragments])
-        merge_distance = config.get("merge_distance", 1.5)
-        distance_matrix = _pairwise_xy_gap_matrix(mins, maxs)
+        max_z_gap = config.get("merge_max_z_gap")
+        max_z_gap = None if max_z_gap is None else float(max_z_gap)
+        vertical_min_xy_overlap = float(config.get("vertical_merge_min_xy_overlap", 0.05))
+        distance_matrix = _fragment_merge_distance_matrix(
+            fragments,
+            float(merge_distance),
+            max_z_gap,
+            vertical_min_xy_overlap,
+        )
         group_labels = DBSCAN(
             eps=merge_distance, min_samples=1, metric="precomputed"
         ).fit_predict(distance_matrix)
 
-    candidates: list[ClusterCandidate] = []
-    for group_label in sorted(set(group_labels)):
-        members = [f for f, g in zip(fragments, group_labels) if g == group_label]
+    def build_candidate(members: list[_Fragment]) -> tuple[ClusterCandidate | None, str]:
         group_indices = np.concatenate([m.indices for m in members])
         group_points = filtered_points[group_indices]
 
         point_count = len(group_points)
         if point_count < min_point_count:
-            continue
+            return None, "point_count"
 
         group_mins = group_points.min(axis=0)
         group_maxs = group_points.max(axis=0)
         size = group_maxs - group_mins
+        if (
+            max_candidate_base_height is not None
+            and group_mins[2] > max_candidate_base_height
+        ):
+            return None, "base_height"
         if size.max() > max_merged_extent:
-            continue  # 合并结果明显不合理（比如链式合并出几十米长），整条丢弃
+            return None, "extent"
+        if size[2] < min_vertical_extent:
+            return None, "vertical_extent"
 
-        volume, flatness = _shape_features(group_points)
-        if volume < min_volume or volume > max_volume:
-            continue
+        horizontal_long = float(max(size[0], size[1]))
+        horizontal_short = float(max(1e-6, min(size[0], size[1])))
+        max_horizontal_aspect_ratio = config.get("max_horizontal_aspect_ratio")
+        if (
+            max_horizontal_aspect_ratio is not None
+            and float(max_horizontal_aspect_ratio) > 0
+            and horizontal_long / horizontal_short > float(max_horizontal_aspect_ratio)
+        ):
+            return None, "horizontal_aspect_ratio"
+
+        low_height_threshold = float(config.get("low_height_threshold", 0.0))
+        max_low_height_area = config.get("max_low_height_horizontal_area")
+        horizontal_area = float(size[0] * size[1])
+        if (
+            max_low_height_area is not None
+            and float(max_low_height_area) > 0
+            and size[2] <= low_height_threshold
+            and horizontal_area > float(max_low_height_area)
+        ):
+            return None, "low_height_horizontal_area"
+
+        volume, flatness, thickness_ratio = _shape_features(group_points)
+        if volume < min_volume:
+            return None, "volume_low"
+        if volume > max_volume:
+            return None, "volume_high"
         if flatness < min_flatness:
-            continue
+            return None, "flatness"
+        if thickness_ratio < min_thickness_ratio:
+            return None, "thickness"
 
         centroid = group_points.mean(axis=0)
         merged_fragment_count = len(members)
+        confidence = float(np.average(
+            [member.confidence for member in members],
+            weights=[len(member.indices) for member in members],
+        ))
+        if confidence < min_cluster_confidence:
+            return None, "confidence"
 
-        if merged_fragment_count > 1:
-            # 多个独立碎片能拼成一个通过所有几何检查的连贯结构，是比单个碎片更强的证据。
+        high_confidence = float(config.get("high_confidence_threshold", 0.8))
+        if confidence >= high_confidence:
             status = "Possible Missing Annotation"
         else:
-            # 没有被合并：沿用"离过滤阈值有多近"这套模糊判断，供人工判断优先看哪些候选。
-            near_boundary = (
-                point_count < min_point_count * 2
-                or volume < min_volume * 2
-                or volume > max_volume * 0.5
-            )
-            status = "Suspicious Residual Cluster" if near_boundary else "Possible Missing Annotation"
+            status = "Suspicious Residual Cluster"
 
-        candidates.append(
-            ClusterCandidate(
-                cluster_id="+".join(f"cluster_{m.label}" for m in members),
-                point_indices=group_indices.tolist(),
-                centroid=tuple(float(v) for v in centroid),
-                point_count=point_count,
-                bbox_hint={
-                    "min": tuple(float(v) for v in group_mins),
-                    "max": tuple(float(v) for v in group_maxs),
-                    "size": tuple(float(v) for v in size),
-                },
-                status=status,
-                merged_fragment_count=merged_fragment_count,
-            )
+        cluster_id = (
+            f"cluster_{members[0].label}"
+            if len(members) == 1
+            else f"cluster_{members[0].label}_m{len(members)}"
         )
+        return ClusterCandidate(
+            cluster_id=cluster_id,
+            point_indices=group_indices.tolist(),
+            points_xyz=group_points.copy(),
+            centroid=tuple(float(v) for v in centroid),
+            point_count=point_count,
+            bbox_hint={
+                "min": tuple(float(v) for v in group_mins),
+                "max": tuple(float(v) for v in group_maxs),
+                "size": tuple(float(v) for v in size),
+            },
+            status=status,
+            merged_fragment_count=merged_fragment_count,
+            pca_thickness_ratio=thickness_ratio,
+            cluster_confidence=confidence,
+            clustering_method=clustering_method,
+        ), ""
+
+    candidates: list[ClusterCandidate] = []
+    preserve_on_reject = bool(config.get("preserve_fragments_on_merge_reject", False))
+    for group_label in sorted(set(group_labels)):
+        members = [f for f, g in zip(fragments, group_labels) if g == group_label]
+        if _group_depends_on_weak_gap(members, filtered_points, merge_distance, config):
+            continue
+
+        candidate, reject_reason = build_candidate(members)
+        if candidate is not None:
+            candidates.append(candidate)
+            continue
+
+        if (
+            preserve_on_reject
+            and len(members) > 1
+            and reject_reason in {"extent", "volume_high"}
+        ):
+            for member in members:
+                fallback, _ = build_candidate([member])
+                if fallback is not None:
+                    candidates.append(fallback)
 
     return candidates

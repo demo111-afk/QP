@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=QP Copilot
+Comment=Start QP Copilot inspection UI
+Exec="@PROJECT_DIR@/start_qp_copilot.sh"
+Path=@PROJECT_DIR@
+Icon=applications-engineering
+Terminal=false
+StartupNotify=true
+Categories=Utility;

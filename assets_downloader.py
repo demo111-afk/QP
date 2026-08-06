@@ -22,7 +22,7 @@ Rule Engine、Report 完全无关——那几个模块每一帧都照常跑，�
   assets/
     scene_<scene_id>/
       metadata.json
-      frame_0001/
+      frame_0002/
         pointcloud.pcd
         images/
           camera_xxx.jpg
@@ -48,9 +48,9 @@ _CAMERA_NAME_RE = re.compile(r"/camera/([A-Za-z0-9_\-]+)/", re.IGNORECASE)
 def should_download_frame(frame_index: int, start_frame_index: int, sample_interval: int) -> bool:
     """按 sample_interval 决定这一帧要不要下载 PCD/JPG 文件本体。
 
-    规则：(frame_index - start_frame_index) % sample_interval == 0。
-    例如 81 帧、start_frame_index=1、sample_interval=10 时，命中 1,11,21,...,81，
-    跟需求里给的例子完全一致。sample_interval=1 时每一帧都下载。
+    规则：(frame_index - start_frame_index) % sample_interval == 0。start_frame_index
+    由主流程传入实际质检起点；默认跳过 Scene 首帧后起点为 2，因此 interval=10 时
+    命中 2,12,22,...。sample_interval=1 时下载每个实际质检帧。
 
     这个函数只影响 Assets 下载，不影响 BBox 采集 / Rule Engine / Report——那几个
     模块的循环完全不读这个函数的返回值。

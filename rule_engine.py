@@ -59,7 +59,7 @@ from pathlib import Path
 import yaml
 
 import vehicle_dimension_config
-from cluster_detector import OrientedBox, detect_clusters
+from cluster_detector import ClusterCandidate, OrientedBox, detect_clusters
 
 RULE_REPORT_FIELDS = [
     "scene_id",
@@ -74,6 +74,16 @@ RULE_REPORT_FIELDS = [
     "severity",
     "message",
     "evidence",
+    "cluster_id",
+    "cluster_center",
+    "cluster_size",
+    "cameras",
+    "rois",
+    "possible_category",
+    "ai_confidence",
+    "ai_reason",
+    "context_paths",
+    "crop_paths",
 ]
 
 
@@ -104,6 +114,16 @@ class RuleFinding:
     first_frame: int = 0
     last_frame: int = 0
     occurrence_count: int = 1
+    cluster_id: str = ""
+    cluster_center: str = ""
+    cluster_size: str = ""
+    cameras: str = ""
+    rois: str = ""
+    possible_category: str = ""
+    ai_confidence: str = ""
+    ai_reason: str = ""
+    context_paths: str = ""
+    crop_paths: str = ""
 
     def __post_init__(self) -> None:
         # 大部分规则函数只关心 frame_index，不用挨个手动填 first_frame/last_frame——
@@ -462,36 +482,6 @@ def rule_size_outlier(ctx: RuleContext) -> list[RuleFinding]:
     return findings
 
 
-def rule_static_object_position(ctx: RuleContext) -> list[RuleFinding]:
-    """静止目标（灯塔/塔桥/场桥/雪糕筒等，见 static_object_classes 配置）理论上不会动，
-    连续帧 position 变化超过阈值（默认 0.5m）报警——阈值统一用一个数字，不按类别区分。
-
-    跟 PositionJump 一样，要求 frame_index 正好差 1 才比较，避免跳帧被当成"一帧内的
-    位移"，原因见 rule_position_jump() 的说明。"""
-    threshold = ctx.rule_cfg().get("static_object_position_threshold", 0.5)
-    static_classes = set(ctx.rule_cfg().get("static_object_classes", []))
-    findings = []
-    for key, entries in ctx.tracks.items():
-        static_entries = [(fi, box) for fi, box in entries if _label_of(box) in static_classes]
-        prev_pos, prev_frame = None, None
-        for frame_index, box in static_entries:
-            pos = _position(box)
-            if prev_pos is not None and pos is not None and frame_index - prev_frame == 1:
-                dist = _distance(prev_pos, pos)
-                if dist > threshold:
-                    findings.append(RuleFinding(
-                        scene_id=ctx.scene_id, frame_index=frame_index,
-                        track_id=key, bbox_index=box.get("bbox_index", ""), label=_label_of(box),
-                        rule_id="StaticObjectPosition", severity="Warning",
-                        message="Static object position changed.",
-                        evidence=f"track={key}, label={_label_of(box)}, prev_frame={prev_frame}(pos={prev_pos}), "
-                                 f"cur_frame={frame_index}(pos={pos}), dist={dist:.3f}m（阈值 {threshold}m）",
-                    ))
-            if pos is not None:
-                prev_pos, prev_frame = pos, frame_index
-    return findings
-
-
 # ---------------------------------------------------------------------------
 # Phase 2：错标（DimensionMismatch）+ 漏标（PossibleMissingAnnotation）
 # ---------------------------------------------------------------------------
@@ -622,6 +612,61 @@ def _boxes_to_oriented(boxes: list[dict]) -> list[OrientedBox]:
     return oriented
 
 
+@dataclass(frozen=True)
+class _ClusterObservation:
+    frame_index: int
+    candidate_index: int
+    candidate: ClusterCandidate
+
+
+def _group_spatial_cluster_observations(
+    observations: list[_ClusterObservation],
+    max_center_distance: float,
+) -> list[list[_ClusterObservation]]:
+    """按三维中心位置把不同采样帧中的同一固定 Cluster 分到一组。"""
+    if max_center_distance <= 0:
+        return [[observation] for observation in observations]
+
+    tracks: list[list[_ClusterObservation]] = []
+    for frame_index in sorted({observation.frame_index for observation in observations}):
+        frame_observations = [
+            observation for observation in observations if observation.frame_index == frame_index
+        ]
+        used_track_indexes: set[int] = set()
+        for observation in frame_observations:
+            center = observation.candidate.centroid
+            if center is None:
+                tracks.append([observation])
+                continue
+
+            best_track_index = None
+            best_distance = float("inf")
+            for track_index, track in enumerate(tracks):
+                if track_index in used_track_indexes:
+                    continue
+                track_centers = [
+                    item.candidate.centroid for item in track if item.candidate.centroid is not None
+                ]
+                if not track_centers:
+                    continue
+                representative = tuple(
+                    sum(track_center[axis] for track_center in track_centers) / len(track_centers)
+                    for axis in range(3)
+                )
+                distance = math.dist(center, representative)
+                if distance <= max_center_distance and distance < best_distance:
+                    best_track_index = track_index
+                    best_distance = distance
+
+            if best_track_index is None:
+                tracks.append([observation])
+                used_track_indexes.add(len(tracks) - 1)
+            else:
+                tracks[best_track_index].append(observation)
+                used_track_indexes.add(best_track_index)
+    return tracks
+
+
 def rule_possible_missing_annotation(ctx: RuleContext) -> list[RuleFinding]:
     """漏标检测：读取 assets_downloader.py 已下载的 PCD，删除已有 BBox 内部的点
     （cluster_detector.remove_bbox_points），对剩余点云跑 DBSCAN
@@ -637,7 +682,7 @@ def rule_possible_missing_annotation(ctx: RuleContext) -> list[RuleFinding]:
     assets_dir = Path(assets_cfg.get("output_dir", "assets"))
     cluster_cfg = ctx.rule_cfg().get("cluster_detector", {}) or {}
 
-    findings = []
+    observations: list[_ClusterObservation] = []
     for frame_index in sorted(ctx.expected_frame_indices):
         pcd_path = assets_dir / f"scene_{ctx.scene_id}" / f"frame_{frame_index:04d}" / "pointcloud.pcd"
         if not pcd_path.is_file():
@@ -651,21 +696,35 @@ def rule_possible_missing_annotation(ctx: RuleContext) -> list[RuleFinding]:
             continue
 
         for i, candidate in enumerate(candidates):
-            estimated_size = candidate.bbox_hint["size"] if candidate.bbox_hint else None
-            findings.append(RuleFinding(
-                # track_id 必须是每个候选各自唯一的合成值，不能留空字符串——
-                # _merge_persistent_findings() 只按 (track_id, rule_id) 分组，不看 bbox_index，
-                # 同一帧内两个不同的残留聚类如果都用 track_id=""，会被误合并成一条、丢失数据。
-                # 这里天然也没有跨帧身份识别（Phase 2 明确不做 cluster 追踪），所以每个候选
-                # 只在它被发现的那一帧单独成一条记录，不会跨帧合并，这也是语义上正确的。
-                scene_id=ctx.scene_id, frame_index=frame_index,
-                track_id=f"residual_cluster_{frame_index}_{i}",
-                bbox_index=f"cluster_{i}", label="",
-                rule_id="PossibleMissingAnnotation", severity="Warning",
-                message=candidate.status,
-                evidence=f"point_count={candidate.point_count}, center={candidate.centroid}, "
-                         f"estimated_size={estimated_size}, merged_fragment_count={candidate.merged_fragment_count}",
-            ))
+            observations.append(_ClusterObservation(frame_index, i, candidate))
+
+    dedup_distance = float(cluster_cfg.get("spatial_dedup_distance", 1.0))
+    findings = []
+    for track in _group_spatial_cluster_observations(observations, dedup_distance):
+        first = track[0]
+        candidate = first.candidate
+        estimated_size = candidate.bbox_hint["size"] if candidate.bbox_hint else None
+        observed_frames = [observation.frame_index for observation in track]
+        findings.append(RuleFinding(
+            scene_id=ctx.scene_id,
+            frame_index=first.frame_index,
+            first_frame=observed_frames[0],
+            last_frame=observed_frames[-1],
+            occurrence_count=len(observed_frames),
+            track_id=f"residual_cluster_{first.frame_index}_{first.candidate_index}",
+            bbox_index=f"cluster_{first.candidate_index}",
+            label="",
+            rule_id="PossibleMissingAnnotation",
+            severity="Warning",
+            message=candidate.status,
+            evidence=f"point_count={candidate.point_count}, center={candidate.centroid}, "
+                     f"estimated_size={estimated_size}, "
+                     f"clustering_method={candidate.clustering_method}, "
+                     f"cluster_confidence={candidate.cluster_confidence:.4f}, "
+                     f"pca_thickness_ratio={candidate.pca_thickness_ratio}, "
+                     f"merged_fragment_count={candidate.merged_fragment_count}, "
+                     f"observed_frames={observed_frames}",
+        ))
     return findings
 
 
@@ -709,9 +768,9 @@ def _collapse_run(run: list[RuleFinding]) -> RuleFinding:
     """一段连续帧的同一个持续问题，折叠成一条记录（保留第一条的 message/evidence 等，
     只补上 first_frame/last_frame/occurrence_count）。"""
     first = run[0]
-    first.first_frame = run[0].frame_index
-    first.last_frame = run[-1].frame_index
-    first.occurrence_count = len(run)
+    first.first_frame = min(finding.first_frame for finding in run)
+    first.last_frame = max(finding.last_frame for finding in run)
+    first.occurrence_count = sum(finding.occurrence_count for finding in run)
     return first
 
 
@@ -724,7 +783,6 @@ RULE_REGISTRY = {
     "BrokenTrack": rule_broken_track,
     "EmptyFrame": rule_empty_frame,
     "SizeOutlier": rule_size_outlier,
-    "StaticObjectPosition": rule_static_object_position,
     "DimensionMismatch": rule_dimension_mismatch,
     "PossibleMissingAnnotation": rule_possible_missing_annotation,
 }
@@ -785,6 +843,7 @@ def build_rule_summary(
     missing_bbox_frames: list[int],
     scene_id: str,
     expected_frame_indices: list[int] | None = None,
+    vision_stats: dict | None = None,
 ) -> dict:
     """汇总 rule_summary.json 的内容（返回 dict）。total_frames 用 expected_frame_indices
     （main.py 传进来的真实帧数），不传时退化成 bbox_data.csv 里实际出现过的帧号数量。"""
@@ -804,7 +863,7 @@ def build_rule_summary(
         if finding.track_id:
             tracks_with_issues.add(finding.track_id)
 
-    return {
+    summary = {
         "scene_id": scene_id,
         "total_frames": total_frames,
         "total_bbox": total_bbox,
@@ -816,6 +875,9 @@ def build_rule_summary(
         "missing_bbox_frames": sorted(set(missing_bbox_frames)),
         "missing_bbox_count": len(set(missing_bbox_frames)),
     }
+    if vision_stats is not None:
+        summary["vision_test_stats"] = vision_stats
+    return summary
 
 
 def write_rule_summary(
@@ -825,6 +887,7 @@ def write_rule_summary(
     scene_id: str,
     report_cfg: dict,
     expected_frame_indices: list[int] | None = None,
+    vision_stats: dict | None = None,
 ) -> tuple[str, dict]:
     """把 build_rule_summary() 的内容写成 outputs/reports/rule_summary.json，
     返回 (文件路径, summary dict) —— 调用方可以直接拿 summary dict 打印终端汇总，
@@ -833,7 +896,14 @@ def write_rule_summary(
     output_dir.mkdir(parents=True, exist_ok=True)
     filepath = output_dir / "rule_summary.json"
 
-    summary = build_rule_summary(bbox_csv_path, findings, missing_bbox_frames, scene_id, expected_frame_indices)
+    summary = build_rule_summary(
+        bbox_csv_path,
+        findings,
+        missing_bbox_frames,
+        scene_id,
+        expected_frame_indices,
+        vision_stats,
+    )
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 

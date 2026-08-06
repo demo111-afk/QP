@@ -4,5 +4,7 @@
 playwright>=1.45.0      # 浏览器自动化（连接/驱动 Chrome）
 PyYAML>=6.0             # 读取 config.yaml
 numpy>=1.24              # PCD 点云数值运算（cluster_detector.py）
-scikit-learn>=1.3         # DBSCAN 聚类（cluster_detector.py）
+scikit-learn>=1.3         # HDBSCAN/DBSCAN 点云聚类（cluster_detector.py）
 Pillow>=10.0             # 画投影 ROI Debug 图片（cluster_projection.py）
+openai>=1.0              # Qwen-VL OpenAI-compatible API（vision_verifier.py）
+python-dotenv>=1.0        # 自动读取项目根目录 .env（API Key 不写入 config.yaml）

@@ -1,0 +1,68 @@
+# Vision missing-annotation category whitelist.
+# Source: 车辆及设施尺寸参考表.xlsx (中文名称 column).
+# Box/no-box variants remain one AI category; the state is identification guidance only.
+
+categories:
+  - name: "雪糕筒"
+  - name: "行人"
+  - name: "轿车"
+    description: "常见乘用轿车"
+  - name: "卡车头"
+  - name: "卡车拖架"
+    description: "平台 Label 均为托架；尺寸库按实测高型/低型两个变体处理"
+    dimension_keys: ["托架_高型", "托架_低型"]
+  - name: "平板车"
+    description: "允许带箱体或不带箱体"
+    dimension_keys: ["平板车_带箱体", "平板车_不带箱体"]
+  - name: "锁站"
+  - name: "灯塔"
+  - name: "场桥"
+    description: "轮胎吊或轨道吊；必须是完整、独立的场桥目标"
+  - name: "岸桥"
+    description: "必须是完整、独立的岸桥目标"
+  - name: "自身拖挂车"
+    description: "允许带箱体或不带箱体"
+    dimension_keys: ["自身拖挂车_带箱体", "自身拖挂车_不带箱体"]
+  - name: "其他车辆"
+    description: "仅限无法归入其他表内类别的真实车辆，不包含船舶、集装箱或固定设施"
+    dimension_keys: ["其他车"]
+  - name: "工程车"
+    description: "一般工程作业车辆"
+  - name: "大巴车"
+    description: "常见大型客车"
+  - name: "叉车"
+    description: "常见中型叉车"
+  - name: "吊车"
+    description: "按完整车体判断，不把单独吊臂或固定吊装设施归为吊车"
+  - name: "货车"
+    description: "常见中型厢式或栏板货车"
+  - name: "登高车"
+    description: "按完整车体判断"
+  - name: "牵引车"
+    description: "港区或物流牵引车"
+  - name: "飞机拖车甲型"
+    description: "较小型飞机牵引车"
+    dimension_keys: ["飞机拖车A"]
+  - name: "飞机拖车乙型"
+    description: "较大型飞机牵引车"
+    dimension_keys: ["飞机拖车B"]
+  - name: "云梯车"
+    description: "按完整车辆判断"
+  - name: "行李传送带车"
+    description: "按完整车体及收拢传送带判断"
+  - name: "卡车拖架与其他车辆组合"
+    description: "必须能确认是完整组合目标"
+  - name: "自行车（无人）"
+    dimension_keys: ["自行车_无人"]
+  - name: "自行车（有人）"
+    dimension_keys: ["自行车_有人"]
+  - name: "摩托车（无人）"
+    dimension_keys: ["摩托车_无人"]
+  - name: "摩托车（有人）"
+    dimension_keys: ["摩托车_有人"]
+  - name: "三轮车（无人）"
+    dimension_keys: ["三轮车_无人"]
+  - name: "三轮车（有人）"
+    dimension_keys: ["三轮车_有人"]
+  - name: "平台车"
+    description: "常见机场或港区装卸平台车"
