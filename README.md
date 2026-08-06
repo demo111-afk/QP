@@ -687,41 +687,4 @@ Vision。
 新 Run 完成前固定报告仍是旧结果。等待 `[9/9] Inspection Finished`，或运行前 Cleanup。运行中
 不要 Cleanup。
 
----
 
-## 16. 安全与提交
-
-`.gitignore` 排除：
-
-- `.env`
-- `.venv/`
-- `__pycache__/` 和 `*.pyc`
-- `outputs/` 运行结果
-- `assets/` PCD/JPG
-- `ai_inputs/` 图片、Manifest、Cache
-- `*.log`
-
-提交前：
-
-```bash
-git status --short
-git diff --check
-```
-
-不要提交真实 API Key、Cookie、PCD/JPG、客户 Calibration 或 Scene 报告。
-
----
-
-## 17. 最终 Run 检查表
-
-- [ ] `.venv` 已创建，依赖完整
-- [ ] `.env` 已填写 `DASHSCOPE_API_KEY`
-- [ ] API 检查返回 `status=verified`
-- [ ] API Base 与 Key 的 Workspace/地域一致
-- [ ] Edge 已用 Remote Debugging 启动
-- [ ] QP 已登录，正确 Scene 质检页面已打开
-- [ ] Edge 中其他标签页已全部关闭，只保留当前质检 Scene 页面
-- [ ] Scene Number、Frame Count 正确
-- [ ] Calibration YAML 与当前 PCD/JPG 匹配
-- [ ] 运行中不移动窗口、不改变缩放、不关闭质检页
-- [ ] 完成后核对两个最终报告的 Scene ID
