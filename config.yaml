@@ -388,7 +388,7 @@ ai_vision:
   provider: "qwen"
   model_name: "qwen3-vl-plus"
   category_whitelist_path: "config/vision_categories.yaml"  # 来自车辆及设施尺寸参考表.xlsx
-  api_base: "https://ws-vcvh6mb9582en9ic.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+  api_base: "https://ws-bci6421vg32rk6vy.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
   api_key_env: "DASHSCOPE_API_KEY"
   timeout: 60
   max_retries: 2
